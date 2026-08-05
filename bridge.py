@@ -72,9 +72,13 @@ Discord, и мост будет работать для оставшейся п�
 - Reply на XMPP-сторону детектируется только если клиент отправителя
   реализует структурированный XEP-0461 (`<reply id="..."/>`). Судя по
   всему, Monocles Chat пока просто визуально имитирует цитату текстом
-  в теле сообщения, без структурированной пометки — в этом случае
-  мост не может понять, что это ответ именно на конкретное сообщение,
-  и пересылает как обычный текст (с этой цитатой внутри).
+  в теле сообщения, без структурированной пометки. Для этого случая
+  добавлена ЭКСПЕРИМЕНТАЛЬНАЯ эвристика: бот распознаёт вставленную
+  текстом цитату ("> текст\n\nответ") и пытается сопоставить её с
+  недавно отправленными в комнату сообщениями по содержимому текста.
+  Работает не идеально — может ошибиться на очень похожих или совсем
+  коротких сообщениях, и не сработает, если исходный текст сильно
+  обрезан клиентом при цитировании.
 - Ответы (reply) работают, только если исходное сообщение (на которое
   отвечают) было переслано мостом, то есть связка для него ещё жива
   в памяти (см. MESSAGE_MAP_TTL_SECONDS ниже). Ответ на что-то более
@@ -86,6 +90,14 @@ Discord, и мост будет работать для оставшейся п�
 - Опросы (Telegram/Discord polls) пересылаются как текстовый снимок
   вопроса и вариантов на момент создания — не как настоящий
   интерактивный опрос, и результаты голосования не обновляются.
+- Форматирование текста Telegram (жирный, курсив, зачёркнутый, код,
+  ссылки, спойлер) конвертируется в разметку Discord и в XEP-0393
+  Message Styling для XMPP. Подчёркивание и спойлеры не имеют аналога
+  в XEP-0393 — при пересылке в XMPP эти два вида просто теряют
+  оформление (текст остаётся, разметка — нет). Форматирование
+  распознаётся только для сообщений и правок ИЗ Telegram — форматирование
+  из XMPP (XEP-0393) или Discord (markdown) пока не конвертируется в
+  обратную сторону.
 - Файлы с XMPP-стороны (в т.ч. голосовые) скачиваются и пересылаются
   как настоящие вложения; если скачать по ссылке не удалось (например,
   сервер требует авторизацию) — пересылается просто ссылкой.
@@ -99,6 +111,7 @@ import re
 import shutil
 import tempfile
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 
@@ -299,6 +312,65 @@ def _get_reply_key(origin: str, replied_native_id) -> Optional[str]:
     return lookup.get(replied_native_id)
 
 
+# ------------------------------------------------------------------------
+# ЭКСПЕРИМЕНТАЛЬНОЕ: распознавание "ручных" текстовых цитат Monocles Chat
+# ------------------------------------------------------------------------
+# Monocles Chat, судя по всему, не отправляет структурированный XEP-0461
+# reply — вместо этого он просто вставляет цитату исходного сообщения
+# текстом прямо в тело: "> исходный текст\n\nновый текст". Ниже — попытка
+# распознать такую цитату и сопоставить её с недавно отправленными в эту
+# же XMPP-комнату сообщениями по содержимому текста, чтобы всё равно
+# получить настоящий reply на других площадках. Метод эвристический —
+# может ошибаться на коротких/похожих сообщениях.
+
+_recent_xmpp_texts: list = []  # [(key, text, ts), ...]
+
+
+def _remember_xmpp_text(key: str, text: str) -> None:
+    text = (text or "").strip()
+    if not text:
+        return
+    _recent_xmpp_texts.append((key, text, time.monotonic()))
+    if len(_recent_xmpp_texts) > 200:
+        del _recent_xmpp_texts[: len(_recent_xmpp_texts) - 200]
+
+
+def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
+    quoted = (quoted or "").strip()
+    if not quoted:
+        return None
+    now = time.monotonic()
+    for key, text, ts in reversed(_recent_xmpp_texts):
+        if now - ts > MESSAGE_MAP_TTL_SECONDS:
+            continue
+        if key not in _bridge_records:
+            continue
+        if quoted in text or text in quoted:
+            return key
+    return None
+
+
+def _parse_manual_quote(body: str):
+    """Пытается распознать цитату вида '> ...\\n> ...\\n\\nостальной текст'.
+
+    Возвращает (quoted_text, remaining_text). Если цитаты нет —
+    (None, body).
+    """
+    lines = body.split("\n")
+    quoted_lines = []
+    i = 0
+    while i < len(lines) and lines[i].startswith(">"):
+        quoted_lines.append(lines[i].lstrip(">").strip())
+        i += 1
+    if not quoted_lines:
+        return None, body
+    if i < len(lines) and lines[i].strip() == "":
+        i += 1
+    remaining = "\n".join(lines[i:]).strip()
+    quoted_text = " ".join(line for line in quoted_lines if line).strip()
+    return quoted_text, remaining
+
+
 # Простое (не идеальное) распознавание "текст состоит только из эмодзи" —
 # без внешней зависимости на пакет `emoji`. Покрывает подавляющее
 # большинство современных эмодзи (включая ZWJ-последовательности и
@@ -341,6 +413,99 @@ discord_bridge = None    # type: Optional["DiscordBridge"]
 # ========================================================================
 # ОБЩИЕ ПОМОЩНИКИ
 # ========================================================================
+
+_DISCORD_MARKERS = {
+    "b": "**", "strong": "**",
+    "i": "*", "em": "*",
+    "u": "__", "ins": "__",
+    "s": "~~", "strike": "~~", "del": "~~",
+}
+# XEP-0393 (Message Styling) поддерживает только *bold*, _italic_, ~strike~,
+# `code`/```pre``` и > quote — нет подчёркивания и спойлеров, поэтому для
+# них маркер просто пустой (форматирование теряется, но текст остаётся).
+_XMPP_MARKERS = {
+    "b": "*", "strong": "*",
+    "i": "_", "em": "_",
+    "s": "~", "strike": "~", "del": "~",
+}
+
+
+def _format_from_telegram_html(html_text: str, target: str) -> str:
+    """Конвертирует HTML-разметку Telegram (msg.text_html/caption_html) в
+    разметку, понятную XMPP (XEP-0393 Message Styling) или Discord
+    (обычный markdown). target: 'xmpp' или 'discord'.
+    """
+    markers = _DISCORD_MARKERS if target == "discord" else _XMPP_MARKERS
+
+    class _Conv(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.out = []
+            self.tag_stack = []  # [(tag, "закрывающий_маркер_или_href")]
+
+        def handle_starttag(self, tag, attrs):
+            attrs_dict = dict(attrs)
+            if tag == "span" and attrs_dict.get("class") == "tg-spoiler":
+                marker = "||" if target == "discord" else ""
+                self.tag_stack.append(("span", marker))
+                self.out.append(marker)
+            elif tag == "code":
+                self.tag_stack.append(("code", "`"))
+                self.out.append("`")
+            elif tag == "pre":
+                self.tag_stack.append(("pre", "```"))
+                self.out.append("```")
+            elif tag == "a":
+                href = attrs_dict.get("href", "")
+                self.tag_stack.append(("a", href))
+                if target == "discord":
+                    self.out.append("[")
+            elif tag == "blockquote":
+                self.tag_stack.append(("blockquote", ""))
+                self.out.append("\n> ")
+            elif tag in markers:
+                marker = markers[tag]
+                self.tag_stack.append((tag, marker))
+                self.out.append(marker)
+            else:
+                self.tag_stack.append((tag, ""))
+
+        def handle_endtag(self, tag):
+            if not self.tag_stack:
+                return
+            _open_tag, marker = self.tag_stack.pop()
+            if _open_tag == "a":
+                href = marker
+                if target == "discord":
+                    self.out.append(f"]({href})")
+                elif href:
+                    self.out.append(f" ({href})")
+            elif _open_tag == "blockquote":
+                pass
+            else:
+                self.out.append(marker)
+
+        def handle_data(self, data):
+            self.out.append(data)
+
+    conv = _Conv()
+    try:
+        conv.feed(html_text)
+        conv.close()
+    except Exception:
+        logger.exception("Не удалось разобрать форматирование Telegram, отправляю как обычный текст")
+        return html_text
+    return "".join(conv.out)
+
+
+def _format_tg_text(plain_text: Optional[str], html_text: Optional[str], target: str) -> str:
+    """Возвращает текст сообщения с конвертированным форматированием,
+    либо обычный текст, если форматирования нет/распознать не удалось.
+    """
+    if not html_text:
+        return plain_text or ""
+    return _format_from_telegram_html(html_text, target)
+
 
 def _convert_static_sticker_to_png(path: Path) -> Path:
     """Конвертирует статический webp-стикер в PNG для совместимости."""
@@ -514,17 +679,35 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
         # --- обычное новое сообщение ---
         reply_id = msg["reply"]["id"] or None
+        effective_body = body
+        quote_matched_key = None
+
+        # Структурированного XEP-0461 reply нет — пробуем распознать
+        # "ручную" текстовую цитату (так делает Monocles Chat) и
+        # сопоставить её с недавно отправленными сообщениями по тексту.
+        if not reply_id and body.startswith(">"):
+            quoted_text, remaining_text = _parse_manual_quote(body)
+            if quoted_text:
+                quote_matched_key = _find_key_by_quoted_text(quoted_text)
+                if quote_matched_key:
+                    effective_body = remaining_text
 
         # Ответ одним (или несколькими) эмодзи на пересланное сообщение —
         # считаем это реакцией, а не обычным ответом (полезно, если в
         # клиенте нет отдельной кнопки для реакций).
-        if reply_id and body and not oob_url and _is_emoji_only(body):
-            reaction_key = _get_reply_key("xmpp", reply_id)
+        if (reply_id or quote_matched_key) and effective_body and not oob_url and _is_emoji_only(effective_body):
+            reaction_key = _get_reply_key("xmpp", reply_id) if reply_id else quote_matched_key
             if reaction_key:
-                await _mirror_reactions(reaction_key, _extract_emojis(body), skip="xmpp")
+                await _mirror_reactions(reaction_key, _extract_emojis(effective_body), skip="xmpp")
                 return
 
-        reply_targets = _get_reply_targets("xmpp", reply_id) if reply_id else {}
+        if reply_id:
+            reply_targets = _get_reply_targets("xmpp", reply_id)
+        elif quote_matched_key:
+            _record = _bridge_records.get(quote_matched_key, {})
+            reply_targets = {k: v for k, v in _record.items() if k in ("tg", "xmpp", "discord") and v is not None}
+        else:
+            reply_targets = {}
 
         # Пробуем реально скачать файл по OOB-ссылке и переслать как
         # настоящее вложение (фото/видео/голосовое/документ), а не
@@ -552,9 +735,10 @@ class XMPPBridge(slixmpp.ClientXMPP):
             _link_record(key, xmpp=canonical_id)
         if client_id and client_id != canonical_id:
             _xmpp_lookup[client_id] = key  # доп. ключ — на случай, если кто-то сошлётся по нему
+        _remember_xmpp_text(key, body)  # для будущего сопоставления чужих текстовых цитат
 
         if local_path is not None:
-            caption = f"{sender}: {body}" if body and body != oob_url else sender
+            caption = f"{sender}: {effective_body}" if effective_body and effective_body != oob_url else sender
             try:
                 if telegram_app:
                     try:
@@ -576,9 +760,9 @@ class XMPPBridge(slixmpp.ClientXMPP):
             return
 
         # --- нет вложения (или не удалось скачать) — обычный текст/ссылка ---
-        text = f"{sender}: {oob_url}" if oob_url and not body else f"{sender}: {body}"
-        if oob_url and body and body != oob_url:
-            text = f"{sender}: {body}\n{oob_url}"
+        text = f"{sender}: {oob_url}" if oob_url and not effective_body else f"{sender}: {effective_body}"
+        if oob_url and effective_body and effective_body != oob_url:
+            text = f"{sender}: {effective_body}\n{oob_url}"
 
         if telegram_app:
             try:
@@ -815,6 +999,7 @@ class DiscordBridge(_DiscordBase):
             try:
                 xmpp_id = await xmpp_bridge.send_text(text, reply_to=reply_targets.get("xmpp"))
                 _link_record(key, xmpp=xmpp_id)
+                _remember_xmpp_text(key, text)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Discord в XMPP")
 
@@ -1047,17 +1232,22 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     # --- чистый текст, без вложений ---
     if msg.text and not has_media:
-        text = f"{author}: {msg.text}"
+        xmpp_body = _format_tg_text(msg.text, msg.text_html, "xmpp")
+        discord_body = _format_tg_text(msg.text, msg.text_html, "discord")
         key = _new_bridge_record(tg=msg.message_id)
         if xmpp_bridge:
             try:
-                xmpp_id = await xmpp_bridge.send_text(text, reply_to=reply_targets.get("xmpp"))
+                xmpp_full_text = f"{author}: {xmpp_body}"
+                xmpp_id = await xmpp_bridge.send_text(xmpp_full_text, reply_to=reply_targets.get("xmpp"))
                 _link_record(key, xmpp=xmpp_id)
+                _remember_xmpp_text(key, xmpp_full_text)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Telegram в XMPP")
         if discord_bridge:
             try:
-                discord_id = await discord_bridge.send_text(text, reply_to=reply_targets.get("discord"))
+                discord_id = await discord_bridge.send_text(
+                    f"{author}: {discord_body}", reply_to=reply_targets.get("discord")
+                )
                 _link_record(key, discord=discord_id)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Telegram в Discord")
@@ -1066,7 +1256,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not has_media:
         return  # сервисное сообщение и т.п.
 
-    caption = f"{author}: {msg.caption}" if msg.caption else author
+    caption_xmpp = f"{author}: {_format_tg_text(msg.caption, msg.caption_html, 'xmpp')}" if msg.caption else author
+    caption_discord = (
+        f"{author}: {_format_tg_text(msg.caption, msg.caption_html, 'discord')}" if msg.caption else author
+    )
 
     file_obj = None
     suffix = ""
@@ -1130,7 +1323,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if xmpp_bridge:
             try:
                 xmpp_id = await xmpp_bridge.send_file(
-                    local_path, caption=caption, reply_to=reply_targets.get("xmpp")
+                    local_path, caption=caption_xmpp, reply_to=reply_targets.get("xmpp")
                 )
                 if xmpp_id:
                     _link_record(key, xmpp=xmpp_id)
@@ -1139,7 +1332,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if discord_bridge:
             try:
                 discord_id = await discord_bridge.send_file(
-                    local_path, caption=caption, reply_to=reply_targets.get("discord")
+                    local_path, caption=caption_discord, reply_to=reply_targets.get("discord")
                 )
                 if discord_id:
                     _link_record(key, discord=discord_id)
@@ -1176,16 +1369,17 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
         return
 
     author = msg.from_user.first_name if msg.from_user else "Telegram"
-    text = f"{author}: {msg.text}"
 
     if xmpp_bridge and record.get("xmpp"):
         try:
-            await xmpp_bridge.send_correction(text, record["xmpp"])
+            xmpp_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'xmpp')}"
+            await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
         except Exception:
             logger.exception("Не удалось переслать исправление в XMPP")
     if discord_bridge and record.get("discord"):
         try:
-            await discord_bridge.send_correction(record["discord"], text)
+            discord_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'discord')}"
+            await discord_bridge.send_correction(record["discord"], discord_text)
         except Exception:
             logger.exception("Не удалось переслать исправление в Discord")
 
