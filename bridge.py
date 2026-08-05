@@ -75,8 +75,12 @@ Discord, и мост будет работать для оставшейся п�
 - Вся связка сообщений между площадками хранится в памяти процесса и
   теряется при перезапуске бота (старые сообщения после перезапуска
   уже нельзя отредактировать/реагировать через мост).
-- Пересылка XMPP-файлов (не Telegram/Discord) идёт только ссылкой —
-  сам файл с XMPP-стороны на другие площадки не перезаливается.
+- Опросы (Telegram/Discord polls) пересылаются как текстовый снимок
+  вопроса и вариантов на момент создания — не как настоящий
+  интерактивный опрос, и результаты голосования не обновляются.
+- Файлы с XMPP-стороны (в т.ч. голосовые) скачиваются и пересылаются
+  как настоящие вложения; если скачать по ссылке не удалось (например,
+  сервер требует авторизацию) — пересылается просто ссылкой.
 """
 
 import asyncio
@@ -361,6 +365,30 @@ async def _download_discord_attachment(attachment) -> Path:
     return local_path
 
 
+async def _download_url_to_file(url: str) -> Path:
+    """Скачивает файл по прямой ссылке (используется для OOB-ссылок из XMPP)."""
+    import hashlib
+    import mimetypes
+    import aiohttp
+    from urllib.parse import urlparse
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            data = await resp.read()
+            content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+
+    # Пытаемся определить расширение: сначала из самого URL, иначе по Content-Type.
+    suffix = Path(urlparse(url).path).suffix
+    if not suffix and content_type:
+        suffix = mimetypes.guess_extension(content_type) or ""
+
+    name_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+    local_path = TMP_DIR / f"xmpp_{name_hash}{suffix}"
+    local_path.write_bytes(data)
+    return local_path
+
+
 # ========================================================================
 # XMPP-СТОРОНА
 # ========================================================================
@@ -488,11 +516,20 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 await _mirror_reactions(reaction_key, _extract_emojis(body), skip="xmpp")
                 return
 
-        text = f"{sender}: {oob_url}" if oob_url and not body else f"{sender}: {body}"
-        if oob_url and body and body != oob_url:
-            text = f"{sender}: {body}\n{oob_url}"
-
         reply_targets = _get_reply_targets("xmpp", reply_id) if reply_id else {}
+
+        # Пробуем реально скачать файл по OOB-ссылке и переслать как
+        # настоящее вложение (фото/видео/голосовое/документ), а не
+        # просто ссылкой — так пересланное с XMPP-стороны видно так же,
+        # как обычное медиа.
+        local_path = None
+        if oob_url:
+            try:
+                local_path = await _download_url_to_file(oob_url)
+            except Exception:
+                logger.warning(
+                    "Не удалось скачать файл по OOB-ссылке (%s) — пришлю просто ссылкой", oob_url
+                )
 
         key = _new_bridge_record()
         client_id = msg["id"] or None
@@ -507,6 +544,33 @@ class XMPPBridge(slixmpp.ClientXMPP):
             _link_record(key, xmpp=canonical_id)
         if client_id and client_id != canonical_id:
             _xmpp_lookup[client_id] = key  # доп. ключ — на случай, если кто-то сошлётся по нему
+
+        if local_path is not None:
+            caption = f"{sender}: {body}" if body and body != oob_url else sender
+            try:
+                if telegram_app:
+                    try:
+                        sent = await _tg_send_file(local_path, caption, reply_to=reply_targets.get("tg"))
+                        if sent is not None:
+                            _link_record(key, tg=sent.message_id)
+                    except Exception:
+                        logger.exception("Не удалось переслать медиа из XMPP в Telegram")
+                if discord_bridge:
+                    try:
+                        discord_id = await discord_bridge.send_file(
+                            local_path, caption=caption, reply_to=reply_targets.get("discord")
+                        )
+                        _link_record(key, discord=discord_id)
+                    except Exception:
+                        logger.exception("Не удалось переслать медиа из XMPP в Discord")
+            finally:
+                local_path.unlink(missing_ok=True)
+            return
+
+        # --- нет вложения (или не удалось скачать) — обычный текст/ссылка ---
+        text = f"{sender}: {oob_url}" if oob_url and not body else f"{sender}: {body}"
+        if oob_url and body and body != oob_url:
+            text = f"{sender}: {body}\n{oob_url}"
 
         if telegram_app:
             try:
@@ -670,6 +734,37 @@ class DiscordBridge(_DiscordBase):
                 return
 
         reply_targets = _get_reply_targets("discord", replied_id) if replied_id else {}
+
+        # --- опрос (poll) ---
+        poll = getattr(message, "poll", None)
+        if poll is not None:
+            try:
+                question = poll.question.text if hasattr(poll.question, "text") else str(poll.question)
+                lines = [f"📊 Опрос от {author}: {question}"]
+                for i, answer in enumerate(poll.answers, start=1):
+                    answer_text = answer.text if hasattr(answer, "text") else str(answer)
+                    lines.append(f"{i}) {answer_text}")
+                text = "\n".join(lines)
+            except Exception:
+                logger.exception("Не удалось разобрать опрос Discord, пересылаю как есть")
+                text = f"{author}: [опрос — не удалось получить содержимое]"
+            key = _new_bridge_record(discord=message.id)
+            if xmpp_bridge:
+                try:
+                    xmpp_id = await xmpp_bridge.send_text(text, reply_to=reply_targets.get("xmpp"))
+                    _link_record(key, xmpp=xmpp_id)
+                except Exception:
+                    logger.exception("Не удалось переслать опрос из Discord в XMPP")
+            if telegram_app:
+                try:
+                    sent = await telegram_app.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID, text=text,
+                        reply_to_message_id=reply_targets.get("tg"),
+                    )
+                    _link_record(key, tg=sent.message_id)
+                except Exception:
+                    logger.exception("Не удалось переслать опрос из Discord в Telegram")
+            return
 
         # --- вложения ---
         for attachment in message.attachments:
@@ -847,24 +942,27 @@ _MEDIA_ATTRS = ("photo", "video", "voice", "audio", "document", "sticker", "vide
 
 async def _tg_send_file(
     local_path: Path, caption: str, reply_to: Optional[int] = None
-) -> None:
-    """Отправляет файл в Telegram, подбирая подходящий метод по расширению."""
+):
+    """Отправляет файл в Telegram, подбирая подходящий метод по расширению.
+
+    Возвращает отправленное telegram.Message (нужно для связки reply/правок).
+    """
     suffix = local_path.suffix.lower()
     with open(local_path, "rb") as f:
         if suffix in (".jpg", ".jpeg", ".png", ".webp"):
-            await telegram_app.bot.send_photo(
+            return await telegram_app.bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID, photo=f, caption=caption, reply_to_message_id=reply_to
             )
         elif suffix in (".mp4", ".mov", ".webm"):
-            await telegram_app.bot.send_video(
+            return await telegram_app.bot.send_video(
                 chat_id=TELEGRAM_CHAT_ID, video=f, caption=caption, reply_to_message_id=reply_to
             )
-        elif suffix in (".mp3", ".ogg", ".wav", ".m4a"):
-            await telegram_app.bot.send_audio(
+        elif suffix in (".mp3", ".ogg", ".oga", ".wav", ".m4a", ".opus"):
+            return await telegram_app.bot.send_audio(
                 chat_id=TELEGRAM_CHAT_ID, audio=f, caption=caption, reply_to_message_id=reply_to
             )
         else:
-            await telegram_app.bot.send_document(
+            return await telegram_app.bot.send_document(
                 chat_id=TELEGRAM_CHAT_ID, document=f, caption=caption, reply_to_message_id=reply_to
             )
 
@@ -908,6 +1006,29 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
 
     reply_targets = _get_reply_targets("tg", replied_id) if replied_id else {}
+
+    # --- опрос (poll) ---
+    if msg.poll:
+        lines = [f"📊 Опрос от {author}: {msg.poll.question}"]
+        for i, option in enumerate(msg.poll.options, start=1):
+            lines.append(f"{i}) {option.text}")
+        if msg.poll.is_anonymous is False:
+            lines.append("(опрос не анонимный)")
+        text = "\n".join(lines)
+        key = _new_bridge_record(tg=msg.message_id)
+        if xmpp_bridge:
+            try:
+                xmpp_id = await xmpp_bridge.send_text(text, reply_to=reply_targets.get("xmpp"))
+                _link_record(key, xmpp=xmpp_id)
+            except Exception:
+                logger.exception("Не удалось переслать опрос из Telegram в XMPP")
+        if discord_bridge:
+            try:
+                discord_id = await discord_bridge.send_text(text, reply_to=reply_targets.get("discord"))
+                _link_record(key, discord=discord_id)
+            except Exception:
+                logger.exception("Не удалось переслать опрос из Telegram в Discord")
+        return
 
     # --- чистый текст, без вложений ---
     if msg.text and not has_media:
