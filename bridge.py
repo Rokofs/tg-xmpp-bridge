@@ -217,9 +217,18 @@ _xmpp_lookup: dict = {}      # xmpp_stanza_id -> key
 _discord_lookup: dict = {}   # discord_message_id -> key
 
 
+def _own_xmpp_reply_jid() -> str:
+    """JID, который надо указывать в 'to' у <reply>/<reactions> для
+    сообщений, которые в комнату/чат отправил сам бот (не важно, чей
+    текст внутри — TG или Discord автора)."""
+    if XMPP_IS_MUC:
+        return f"{XMPP_PEER_JID}/{XMPP_MUC_NICK}"
+    return XMPP_PEER_JID
+
+
 def _new_bridge_record(**ids) -> str:
     key = str(next(_bridge_key_counter))
-    record = {"tg": None, "xmpp": None, "discord": None, "ts": time.monotonic()}
+    record = {"tg": None, "xmpp": None, "discord": None, "xmpp_to": None, "ts": time.monotonic()}
     record.update({k: v for k, v in ids.items() if v is not None})
     _bridge_records[key] = record
     _link_lookup(key, record)
@@ -302,7 +311,7 @@ def _get_reply_targets(origin: str, replied_native_id) -> dict:
     if not key:
         return {}
     record = _bridge_records.get(key, {})
-    return {k: v for k, v in record.items() if k in ("tg", "xmpp", "discord") and v is not None}
+    return {k: v for k, v in record.items() if k in ("tg", "xmpp", "discord", "xmpp_to") and v is not None}
 
 
 def _get_reply_key(origin: str, replied_native_id) -> Optional[str]:
@@ -873,7 +882,9 @@ class XMPPBridge(slixmpp.ClientXMPP):
             reply_targets = _get_reply_targets("xmpp", reply_id)
         elif quote_matched_key:
             _record = _bridge_records.get(quote_matched_key, {})
-            reply_targets = {k: v for k, v in _record.items() if k in ("tg", "xmpp", "discord") and v is not None}
+            reply_targets = {
+                k: v for k, v in _record.items() if k in ("tg", "xmpp", "discord", "xmpp_to") and v is not None
+            }
         else:
             reply_targets = {}
 
@@ -900,7 +911,8 @@ class XMPPBridge(slixmpp.ClientXMPP):
             if sid_el and str(sid_el["by"]) == XMPP_PEER_JID and sid_el["id"]:
                 canonical_id = sid_el["id"]
         if canonical_id:
-            _link_record(key, xmpp=canonical_id)
+            peer_reply_jid = f"{XMPP_PEER_JID}/{sender}" if XMPP_IS_MUC else XMPP_PEER_JID
+            _link_record(key, xmpp=canonical_id, xmpp_to=peer_reply_jid)
         if client_id and client_id != canonical_id:
             _xmpp_lookup[client_id] = key  # доп. ключ — на случай, если кто-то сошлётся по нему
         _remember_xmpp_text(key, body)  # для будущего сопоставления чужих текстовых цитат
@@ -980,18 +992,25 @@ class XMPPBridge(slixmpp.ClientXMPP):
             return
         await _mirror_reactions(key, emojis, skip="xmpp")
 
-    async def send_text(self, text: str, reply_to: Optional[str] = None) -> str:
+    async def send_text(
+        self, text: str, reply_to: Optional[str] = None, reply_to_jid: Optional[str] = None
+    ) -> str:
         """Отправляет текст, возвращает КАНОНИЧЕСКИЙ id (для правок/реакций/reply).
 
-        reply_to — id сообщения, на которое отвечаем (XEP-0461). В MUC
-        дожидается эха от сервера с настоящим stanza-id, чтобы reply на
-        это сообщение сразу работал корректно (см. _send_and_confirm).
+        reply_to — id сообщения, на которое отвечаем (XEP-0461).
+        reply_to_jid — полный JID автора этого сообщения (с ником-ресурсом
+        в MUC) для атрибута 'to' у <reply> — без него некоторые клиенты
+        (замечено на Monocles Chat) не признают reply валидным. Если не
+        передан, используем JID комнаты/собеседника как раньше (может не
+        сработать в MUC).
+        В MUC дожидается эха от сервера с настоящим stanza-id, чтобы
+        reply на это сообщение сразу работал корректно (см. _send_and_confirm).
         """
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=text, mtype=mtype)
         if reply_to:
             stanza["reply"]["id"] = reply_to
-            stanza["reply"]["to"] = XMPP_PEER_JID
+            stanza["reply"]["to"] = reply_to_jid or XMPP_PEER_JID
         return await self._send_and_confirm(stanza)
 
     async def send_correction(self, new_text: str, original_stanza_id: str) -> None:
@@ -1004,7 +1023,8 @@ class XMPPBridge(slixmpp.ClientXMPP):
         await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
 
     async def send_file(
-        self, filepath: Path, caption: str = "", reply_to: Optional[str] = None
+        self, filepath: Path, caption: str = "", reply_to: Optional[str] = None,
+        reply_to_jid: Optional[str] = None,
     ) -> Optional[str]:
         """Загружает файл на XMPP-сервер (XEP-0363) и отправляет ссылку с OOB.
 
@@ -1051,7 +1071,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         stanza["oob"]["url"] = url
         if reply_to:
             stanza["reply"]["id"] = reply_to
-            stanza["reply"]["to"] = XMPP_PEER_JID
+            stanza["reply"]["to"] = reply_to_jid or XMPP_PEER_JID
         return await self._send_and_confirm(stanza)
 
 
@@ -1128,8 +1148,10 @@ class DiscordBridge(_DiscordBase):
             key = _new_bridge_record(discord=message.id)
             if xmpp_bridge:
                 try:
-                    xmpp_id = await xmpp_bridge.send_text(text, reply_to=reply_targets.get("xmpp"))
-                    _link_record(key, xmpp=xmpp_id)
+                    xmpp_id = await xmpp_bridge.send_text(
+                        text, reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to")
+                    )
+                    _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                 except Exception:
                     logger.exception("Не удалось переслать опрос из Discord в XMPP")
             if telegram_app:
@@ -1165,10 +1187,11 @@ class DiscordBridge(_DiscordBase):
                 if xmpp_bridge:
                     try:
                         xmpp_id = await xmpp_bridge.send_file(
-                            local_path, caption=caption_xmpp, reply_to=reply_targets.get("xmpp")
+                            local_path, caption=caption_xmpp,
+                            reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to"),
                         )
                         if xmpp_id:
-                            _link_record(key, xmpp=xmpp_id)
+                            _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                     except Exception:
                         logger.exception("Не удалось переслать вложение из Discord в XMPP")
                 if telegram_app:
@@ -1192,8 +1215,10 @@ class DiscordBridge(_DiscordBase):
 
         if xmpp_bridge:
             try:
-                xmpp_id = await xmpp_bridge.send_text(xmpp_text, reply_to=reply_targets.get("xmpp"))
-                _link_record(key, xmpp=xmpp_id)
+                xmpp_id = await xmpp_bridge.send_text(
+                    xmpp_text, reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to")
+                )
+                _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                 _remember_xmpp_text(key, xmpp_text)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Discord в XMPP")
@@ -1417,8 +1442,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         key = _new_bridge_record(tg=msg.message_id)
         if xmpp_bridge:
             try:
-                xmpp_id = await xmpp_bridge.send_text(text, reply_to=reply_targets.get("xmpp"))
-                _link_record(key, xmpp=xmpp_id)
+                xmpp_id = await xmpp_bridge.send_text(
+                    text, reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to")
+                )
+                _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
             except Exception:
                 logger.exception("Не удалось переслать опрос из Telegram в XMPP")
         if discord_bridge:
@@ -1437,8 +1464,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if xmpp_bridge:
             try:
                 xmpp_full_text = f"{author}: {xmpp_body}"
-                xmpp_id = await xmpp_bridge.send_text(xmpp_full_text, reply_to=reply_targets.get("xmpp"))
-                _link_record(key, xmpp=xmpp_id)
+                xmpp_id = await xmpp_bridge.send_text(
+                    xmpp_full_text, reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to")
+                )
+                _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                 _remember_xmpp_text(key, xmpp_full_text)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Telegram в XMPP")
@@ -1522,10 +1551,11 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if xmpp_bridge:
             try:
                 xmpp_id = await xmpp_bridge.send_file(
-                    local_path, caption=caption_xmpp, reply_to=reply_targets.get("xmpp")
+                    local_path, caption=caption_xmpp,
+                    reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to"),
                 )
                 if xmpp_id:
-                    _link_record(key, xmpp=xmpp_id)
+                    _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
             except Exception:
                 logger.exception("Не удалось переслать медиа из Telegram в XMPP")
         if discord_bridge:
