@@ -38,6 +38,11 @@ Discord, и мост будет работать для оставшейся п�
   считается реакцией, а не обычным ответом — удобно, если в клиенте
   нет отдельной кнопки для реакций (например, в некоторых версиях
   Monocles Chat поддержка XEP-0444 ограничена).
+- Для групповых XMPP-чатов (MUC) reply/реакции корректно используют
+  stanza-id (XEP-0359), назначенный самой комнатой, а не клиентский id
+  — так, как того требует спецификация. Без этого reply/реакции,
+  присланные из клиентов вроде Monocles Chat, не находили нужное
+  сообщение и пересылались как обычный текст с цитатой.
 
 УСТАНОВКА
 ---------
@@ -380,6 +385,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         self.register_plugin("xep_0334")  # Message Processing Hints — зависимость xep_0444
         self.register_plugin("xep_0444")  # Message Reactions
         self.register_plugin("xep_0461")  # Message Replies — настоящие ответы на сообщения
+        self.register_plugin("xep_0359")  # Unique and Stable Stanza IDs — нужен для reply/реакций в MUC
 
     async def on_session_start(self, event):
         self.send_presence()
@@ -398,9 +404,34 @@ class XMPPBridge(slixmpp.ClientXMPP):
             return str(msg["from"].bare) == XMPP_PEER_JID
         return str(msg["from"].bare) == XMPP_PEER_JID
 
+    def _learn_own_stanza_id(self, msg) -> None:
+        """MUC-сервер отражает нам наши же сообщения обратно и добавляет
+        к ним <stanza-id> (XEP-0359) — уникальный id, назначенный именно
+        комнатой. Именно на НЕГО (а не на наш собственный client-side id)
+        ссылаются reply/reactions в MUC согласно спецификации — без этого
+        входящие reply/реакции на наши сообщения не находят совпадения.
+        """
+        if not XMPP_IS_MUC:
+            return
+        client_id = msg["id"] or None
+        stanza_id_el = msg["stanza_id"]
+        if not client_id or not stanza_id_el:
+            return
+        if str(stanza_id_el["by"]) != XMPP_PEER_JID:
+            return
+        real_id = stanza_id_el["id"] or None
+        if not real_id or real_id == client_id:
+            return
+        key = _xmpp_lookup.get(client_id)
+        if key:
+            _link_record(key, xmpp=real_id)  # добавляет доп. запись в _xmpp_lookup
+
     async def on_xmpp_message(self, msg):
         """Обрабатывает входящие XMPP-сообщения: новые и правки."""
         if msg["type"] not in ("chat", "normal", "groupchat"):
+            return
+        if XMPP_IS_MUC and str(msg["mucnick"]) == XMPP_MUC_NICK:
+            self._learn_own_stanza_id(msg)
             return
         if not self._is_from_peer(msg):
             return
@@ -464,9 +495,18 @@ class XMPPBridge(slixmpp.ClientXMPP):
         reply_targets = _get_reply_targets("xmpp", reply_id) if reply_id else {}
 
         key = _new_bridge_record()
-        stanza_id = msg["id"] or None
-        if stanza_id:
-            _link_record(key, xmpp=stanza_id)
+        client_id = msg["id"] or None
+        canonical_id = client_id
+        if XMPP_IS_MUC:
+            # В MUC на сообщение принято ссылаться по stanza-id (XEP-0359),
+            # назначенному самой комнатой, а не по клиентскому id отправителя.
+            sid_el = msg["stanza_id"]
+            if sid_el and str(sid_el["by"]) == XMPP_PEER_JID and sid_el["id"]:
+                canonical_id = sid_el["id"]
+        if canonical_id:
+            _link_record(key, xmpp=canonical_id)
+        if client_id and client_id != canonical_id:
+            _xmpp_lookup[client_id] = key  # доп. ключ — на случай, если кто-то сошлётся по нему
 
         if telegram_app:
             try:
