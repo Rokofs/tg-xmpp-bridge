@@ -94,10 +94,11 @@ Discord, и мост будет работать для оставшейся п�
   ссылки, спойлер) конвертируется в разметку Discord и в XEP-0393
   Message Styling для XMPP. Подчёркивание и спойлеры не имеют аналога
   в XEP-0393 — при пересылке в XMPP эти два вида просто теряют
-  оформление (текст остаётся, разметка — нет). Форматирование
-  распознаётся только для сообщений и правок ИЗ Telegram — форматирование
-  из XMPP (XEP-0393) или Discord (markdown) пока не конвертируется в
-  обратную сторону.
+  оформление (текст остаётся, разметка — нет). Форматирование теперь
+  конвертируется в обе стороны между всеми тремя площадками (включая
+  Discord-markdown и XEP-0393 из Monocles Chat), хотя эта часть менее
+  строго проверена, чем разбор Telegram (там точные данные от Bot API,
+  здесь — эвристика по регуляркам).
 - Файлы с XMPP-стороны (в т.ч. голосовые) скачиваются и пересылаются
   как настоящие вложения; если скачать по ссылке не удалось (например,
   сервер требует авторизацию) — пересылается просто ссылкой.
@@ -111,6 +112,7 @@ import re
 import shutil
 import tempfile
 import time
+from html import escape as _html_escape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
@@ -507,6 +509,129 @@ def _format_tg_text(plain_text: Optional[str], html_text: Optional[str], target:
     return _format_from_telegram_html(html_text, target)
 
 
+# ------------------------------------------------------------------------
+# ЭКСПЕРИМЕНТАЛЬНОЕ: конвертация разметки Discord (markdown) и XMPP
+# (XEP-0393 Message Styling) друг в друга и в Telegram HTML.
+# ------------------------------------------------------------------------
+# В отличие от Telegram (где есть точные entity с offset/length),
+# здесь приходится РАСПОЗНАВАТЬ разметку по текстовым маркерам через
+# регулярки — это эвристика: не гарантирует идеальную обработку
+# вложенной/пересекающейся или "случайной" разметки (например, если в
+# обычном тексте просто встретилась одинокая звёздочка).
+
+_MD_CODEBLOCK_RE = re.compile(r"```.*?```", re.S)
+_MD_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+
+
+def _convert_markup(text: str, source: str, target: str) -> str:
+    """source/target: 'discord' | 'xmpp' | 'telegram' (telegram — только
+    как target, для получения HTML с parse_mode='HTML').
+    """
+    if not text or source == target:
+        return _html_escape(text, quote=False) if target == "telegram" else text
+
+    if target == "telegram":
+        text = _html_escape(text, quote=False)
+
+    # 1. Прячем code/pre-блоки от дальнейшей обработки
+    code_stash = []
+
+    def _stash_code(m):
+        code_stash.append(m.group(0))
+        return f"\x00{len(code_stash) - 1}\x00"
+
+    text = _MD_CODEBLOCK_RE.sub(_stash_code, text)
+    text = _MD_INLINE_CODE_RE.sub(_stash_code, text)
+
+    # 2. Прячем ссылки [текст](url)
+    link_stash = []
+
+    def _stash_link(m):
+        link_stash.append((m.group(1), m.group(2)))
+        return f"\x01{len(link_stash) - 1}\x01"
+
+    text = _MD_LINK_RE.sub(_stash_link, text)
+
+    # 3. Распознаём маркеры разметки и СРАЗУ прячем их за плейсхолдеры
+    # (а не сразу подставляем целевой синтаксис!) — иначе, например,
+    # только что созданный "*bold*" для XMPP тут же попадётся под руку
+    # регулярке italic и испортится. Реальный целевой синтаксис
+    # подставляется только в конце, за один проход.
+    style_stash = []  # [(kind, inner_text), ...]
+
+    def _make_style_stasher(kind):
+        def _sub(m):
+            style_stash.append((kind, m.group(1)))
+            return f"\x02{len(style_stash) - 1}\x02"
+        return _sub
+
+    if source == "discord":
+        text = re.sub(r"\*\*(.+?)\*\*", _make_style_stasher("bold"), text, flags=re.S)
+        text = re.sub(r"__(.+?)__", _make_style_stasher("underline"), text, flags=re.S)
+        text = re.sub(r"~~(.+?)~~", _make_style_stasher("strike"), text, flags=re.S)
+        text = re.sub(r"\|\|(.+?)\|\|", _make_style_stasher("spoiler"), text, flags=re.S)
+        text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", _make_style_stasher("italic"), text)
+    else:  # xmpp (XEP-0393) — одиночные маркеры, без подчёркивания/спойлера
+        text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", _make_style_stasher("bold"), text)
+        text = re.sub(r"(?<!_)_([^_\n]+?)_(?!_)", _make_style_stasher("italic"), text)
+        text = re.sub(r"(?<!~)~([^~\n]+?)~(?!~)", _make_style_stasher("strike"), text)
+
+    _TARGET_SYNTAX = {
+        "telegram": {
+            "bold": ("<b>", "</b>"), "italic": ("<i>", "</i>"),
+            "underline": ("<u>", "</u>"), "strike": ("<s>", "</s>"),
+            "spoiler": ('<span class="tg-spoiler">', "</span>"),
+        },
+        "discord": {
+            "bold": ("**", "**"), "italic": ("*", "*"),
+            "underline": ("__", "__"), "strike": ("~~", "~~"),
+            "spoiler": ("||", "||"),
+        },
+        "xmpp": {
+            "bold": ("*", "*"), "italic": ("_", "_"), "strike": ("~", "~"),
+            # подчёркивания/спойлера в XEP-0393 нет — просто нет записи,
+            # ниже это означает "убрать разметку, оставить только текст"
+        },
+    }
+    mapping = _TARGET_SYNTAX[target]
+    for i, (kind, inner) in enumerate(style_stash):
+        placeholder = f"\x02{i}\x02"
+        if kind in mapping:
+            open_m, close_m = mapping[kind]
+            replacement = f"{open_m}{inner}{close_m}"
+        else:
+            replacement = inner  # аналога нет — оставляем только текст
+        text = text.replace(placeholder, replacement)
+
+    # 4. Восстанавливаем ссылки
+    for i, (label, url) in enumerate(link_stash):
+        placeholder = f"\x01{i}\x01"
+        if target == "telegram":
+            replacement = f'<a href="{_html_escape(url, quote=True)}">{label}</a>'
+        elif target == "discord":
+            replacement = f"[{label}]({url})"
+        else:
+            replacement = url if label == url else f"{label} ({url})"
+        text = text.replace(placeholder, replacement)
+
+    # 5. Восстанавливаем code/pre
+    for i, original in enumerate(code_stash):
+        placeholder = f"\x00{i}\x00"
+        if target == "telegram":
+            if original.startswith("```"):
+                inner = original.strip("`")
+                replacement = f"<pre>{inner}</pre>"
+            else:
+                inner = original.strip("`")
+                replacement = f"<code>{inner}</code>"
+        else:
+            replacement = original  # discord/xmpp код-разметка совпадает по синтаксису
+        text = text.replace(placeholder, replacement)
+
+    return text
+
+
 def _convert_static_sticker_to_png(path: Path) -> Path:
     """Конвертирует статический webp-стикер в PNG для совместимости."""
     try:
@@ -576,6 +701,11 @@ class XMPPBridge(slixmpp.ClientXMPP):
         self.add_event_handler("message", self.on_xmpp_message)
         self.add_event_handler("reactions", self.on_xmpp_reactions)
 
+        # client_id -> asyncio.Future, которое разрешается, когда сервер
+        # комнаты отражает наше же сообщение обратно с настоящим
+        # stanza-id (см. _learn_own_stanza_id и send_text/send_file).
+        self._pending_echo_futures: dict = {}
+
         self.register_plugin("xep_0030")  # Service Discovery
         self.register_plugin("xep_0128")  # Service Discovery Extensions — зависимость xep_0363
         self.register_plugin("xep_0199")  # XMPP Ping — держит соединение живым
@@ -611,21 +741,59 @@ class XMPPBridge(slixmpp.ClientXMPP):
         комнатой. Именно на НЕГО (а не на наш собственный client-side id)
         ссылаются reply/reactions в MUC согласно спецификации — без этого
         входящие reply/реакции на наши сообщения не находят совпадения.
+
+        Также разрешает "future", если send_text/send_file ждут
+        подтверждения id именно этого сообщения (см. _send_and_confirm).
         """
         if not XMPP_IS_MUC:
             return
         client_id = msg["id"] or None
+        if not client_id:
+            return
+
+        future = self._pending_echo_futures.pop(client_id, None)
+
         stanza_id_el = msg["stanza_id"]
-        if not client_id or not stanza_id_el:
-            return
-        if str(stanza_id_el["by"]) != XMPP_PEER_JID:
-            return
-        real_id = stanza_id_el["id"] or None
-        if not real_id or real_id == client_id:
-            return
-        key = _xmpp_lookup.get(client_id)
-        if key:
-            _link_record(key, xmpp=real_id)  # добавляет доп. запись в _xmpp_lookup
+        real_id = None
+        if stanza_id_el and str(stanza_id_el["by"]) == XMPP_PEER_JID:
+            real_id = stanza_id_el["id"] or None
+
+        resolved_id = real_id if (real_id and real_id != client_id) else client_id
+
+        if real_id and real_id != client_id:
+            key = _xmpp_lookup.get(client_id)
+            if key:
+                _link_record(key, xmpp=real_id)  # добавляет доп. запись в _xmpp_lookup
+
+        if future is not None and not future.done():
+            future.set_result(resolved_id)
+
+    async def _send_and_confirm(self, stanza) -> str:
+        """Отправляет стензу и, если это MUC, дожидается эха от сервера
+        комнаты с настоящим stanza-id (см. _learn_own_stanza_id) —
+        нужно, чтобы reply/реакции на это сообщение сразу ссылались на
+        правильный id, а не ловили гонку при быстрых последовательных
+        сообщениях. Если эхо не пришло за разумное время — используем
+        клиентский id как есть (не блокируем работу бота навсегда).
+        """
+        client_id = stanza["id"]
+        future = None
+        if XMPP_IS_MUC:
+            future = asyncio.get_event_loop().create_future()
+            self._pending_echo_futures[client_id] = future
+        stanza.send()
+        if future is None:
+            return client_id
+        try:
+            return await asyncio.wait_for(future, timeout=8)
+        except asyncio.TimeoutError:
+            self._pending_echo_futures.pop(client_id, None)
+            logger.warning(
+                "Не дождался эха от MUC для сообщения %s за 8 сек — "
+                "использую клиентский id как есть (reply на него может не сработать)",
+                client_id,
+            )
+            return client_id
 
     async def on_xmpp_message(self, msg):
         """Обрабатывает входящие XMPP-сообщения: новые и правки."""
@@ -738,11 +906,18 @@ class XMPPBridge(slixmpp.ClientXMPP):
         _remember_xmpp_text(key, body)  # для будущего сопоставления чужих текстовых цитат
 
         if local_path is not None:
-            caption = f"{sender}: {effective_body}" if effective_body and effective_body != oob_url else sender
+            base = effective_body if effective_body and effective_body != oob_url else ""
+            caption_tg = (
+                f"{_html_escape(sender, quote=False)}: {_convert_markup(base, 'xmpp', 'telegram')}"
+                if base else _html_escape(sender, quote=False)
+            )
+            caption_discord = f"{sender}: {_convert_markup(base, 'xmpp', 'discord')}" if base else sender
             try:
                 if telegram_app:
                     try:
-                        sent = await _tg_send_file(local_path, caption, reply_to=reply_targets.get("tg"))
+                        sent = await _tg_send_file(
+                            local_path, caption_tg, reply_to=reply_targets.get("tg"), parse_mode="HTML"
+                        )
                         if sent is not None:
                             _link_record(key, tg=sent.message_id)
                     except Exception:
@@ -750,7 +925,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 if discord_bridge:
                     try:
                         discord_id = await discord_bridge.send_file(
-                            local_path, caption=caption, reply_to=reply_targets.get("discord")
+                            local_path, caption=caption_discord, reply_to=reply_targets.get("discord")
                         )
                         _link_record(key, discord=discord_id)
                     except Exception:
@@ -760,14 +935,23 @@ class XMPPBridge(slixmpp.ClientXMPP):
             return
 
         # --- нет вложения (или не удалось скачать) — обычный текст/ссылка ---
-        text = f"{sender}: {oob_url}" if oob_url and not effective_body else f"{sender}: {effective_body}"
-        if oob_url and effective_body and effective_body != oob_url:
-            text = f"{sender}: {effective_body}\n{oob_url}"
+        if oob_url and not effective_body:
+            text_tg = f"{_html_escape(sender, quote=False)}: {_html_escape(oob_url, quote=False)}"
+            text_discord = f"{sender}: {oob_url}"
+        else:
+            converted_tg = _convert_markup(effective_body, "xmpp", "telegram")
+            converted_discord = _convert_markup(effective_body, "xmpp", "discord")
+            if oob_url and effective_body != oob_url:
+                text_tg = f"{_html_escape(sender, quote=False)}: {converted_tg}\n{_html_escape(oob_url, quote=False)}"
+                text_discord = f"{sender}: {converted_discord}\n{oob_url}"
+            else:
+                text_tg = f"{_html_escape(sender, quote=False)}: {converted_tg}"
+                text_discord = f"{sender}: {converted_discord}"
 
         if telegram_app:
             try:
                 sent = await telegram_app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID, text=text,
+                    chat_id=TELEGRAM_CHAT_ID, text=text_tg, parse_mode="HTML",
                     reply_to_message_id=reply_targets.get("tg"),
                 )
                 _link_record(key, tg=sent.message_id)
@@ -776,7 +960,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
         if discord_bridge:
             try:
-                discord_id = await discord_bridge.send_text(text, reply_to=reply_targets.get("discord"))
+                discord_id = await discord_bridge.send_text(text_discord, reply_to=reply_targets.get("discord"))
                 _link_record(key, discord=discord_id)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из XMPP в Discord")
@@ -797,17 +981,18 @@ class XMPPBridge(slixmpp.ClientXMPP):
         await _mirror_reactions(key, emojis, skip="xmpp")
 
     async def send_text(self, text: str, reply_to: Optional[str] = None) -> str:
-        """Отправляет текст, возвращает id отправленной станзы (для правок/реакций).
+        """Отправляет текст, возвращает КАНОНИЧЕСКИЙ id (для правок/реакций/reply).
 
-        reply_to — id station сообщения, на которое отвечаем (XEP-0461).
+        reply_to — id сообщения, на которое отвечаем (XEP-0461). В MUC
+        дожидается эха от сервера с настоящим stanza-id, чтобы reply на
+        это сообщение сразу работал корректно (см. _send_and_confirm).
         """
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=text, mtype=mtype)
         if reply_to:
             stanza["reply"]["id"] = reply_to
             stanza["reply"]["to"] = XMPP_PEER_JID
-        stanza.send()
-        return stanza["id"]
+        return await self._send_and_confirm(stanza)
 
     async def send_correction(self, new_text: str, original_stanza_id: str) -> None:
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
@@ -867,8 +1052,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if reply_to:
             stanza["reply"]["id"] = reply_to
             stanza["reply"]["to"] = XMPP_PEER_JID
-        stanza.send()
-        return stanza["id"]
+        return await self._send_and_confirm(stanza)
 
 
 # ========================================================================
@@ -962,7 +1146,15 @@ class DiscordBridge(_DiscordBase):
         # --- вложения ---
         has_attachments = bool(message.attachments)
         for attachment in message.attachments:
-            caption = f"{author}: {message.content}" if message.content else author
+            if message.content:
+                caption_xmpp = f"{author}: {_convert_markup(message.content, 'discord', 'xmpp')}"
+                caption_tg = (
+                    f"{_html_escape(author, quote=False)}: "
+                    f"{_convert_markup(message.content, 'discord', 'telegram')}"
+                )
+            else:
+                caption_xmpp = author
+                caption_tg = _html_escape(author, quote=False)
             try:
                 local_path = await _download_discord_attachment(attachment)
             except Exception:
@@ -973,7 +1165,7 @@ class DiscordBridge(_DiscordBase):
                 if xmpp_bridge:
                     try:
                         xmpp_id = await xmpp_bridge.send_file(
-                            local_path, caption=caption, reply_to=reply_targets.get("xmpp")
+                            local_path, caption=caption_xmpp, reply_to=reply_targets.get("xmpp")
                         )
                         if xmpp_id:
                             _link_record(key, xmpp=xmpp_id)
@@ -981,7 +1173,9 @@ class DiscordBridge(_DiscordBase):
                         logger.exception("Не удалось переслать вложение из Discord в XMPP")
                 if telegram_app:
                     try:
-                        sent = await _tg_send_file(local_path, caption, reply_to=reply_targets.get("tg"))
+                        sent = await _tg_send_file(
+                            local_path, caption_tg, reply_to=reply_targets.get("tg"), parse_mode="HTML"
+                        )
                         if sent is not None:
                             _link_record(key, tg=sent.message_id)
                     except Exception:
@@ -992,21 +1186,22 @@ class DiscordBridge(_DiscordBase):
         # --- текст (только если не было вложений — иначе текст уже ушёл как подпись) ---
         if has_attachments or not message.content:
             return
-        text = f"{author}: {message.content}"
+        xmpp_text = f"{author}: {_convert_markup(message.content, 'discord', 'xmpp')}"
+        tg_text = f"{_html_escape(author, quote=False)}: {_convert_markup(message.content, 'discord', 'telegram')}"
         key = _new_bridge_record(discord=message.id)
 
         if xmpp_bridge:
             try:
-                xmpp_id = await xmpp_bridge.send_text(text, reply_to=reply_targets.get("xmpp"))
+                xmpp_id = await xmpp_bridge.send_text(xmpp_text, reply_to=reply_targets.get("xmpp"))
                 _link_record(key, xmpp=xmpp_id)
-                _remember_xmpp_text(key, text)
+                _remember_xmpp_text(key, xmpp_text)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Discord в XMPP")
 
         if telegram_app:
             try:
                 sent = await telegram_app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID, text=text,
+                    chat_id=TELEGRAM_CHAT_ID, text=tg_text, parse_mode="HTML",
                     reply_to_message_id=reply_targets.get("tg"),
                 )
                 _link_record(key, tg=sent.message_id)
@@ -1141,7 +1336,7 @@ _MEDIA_ATTRS = ("photo", "video", "voice", "audio", "document", "sticker", "vide
 
 
 async def _tg_send_file(
-    local_path: Path, caption: str, reply_to: Optional[int] = None
+    local_path: Path, caption: str, reply_to: Optional[int] = None, parse_mode: Optional[str] = None
 ):
     """Отправляет файл в Telegram, подбирая подходящий метод по расширению.
 
@@ -1151,19 +1346,23 @@ async def _tg_send_file(
     with open(local_path, "rb") as f:
         if suffix in (".jpg", ".jpeg", ".png", ".webp"):
             return await telegram_app.bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID, photo=f, caption=caption, reply_to_message_id=reply_to
+                chat_id=TELEGRAM_CHAT_ID, photo=f, caption=caption,
+                reply_to_message_id=reply_to, parse_mode=parse_mode,
             )
         elif suffix in (".mp4", ".mov", ".webm"):
             return await telegram_app.bot.send_video(
-                chat_id=TELEGRAM_CHAT_ID, video=f, caption=caption, reply_to_message_id=reply_to
+                chat_id=TELEGRAM_CHAT_ID, video=f, caption=caption,
+                reply_to_message_id=reply_to, parse_mode=parse_mode,
             )
         elif suffix in (".mp3", ".ogg", ".oga", ".wav", ".m4a", ".opus"):
             return await telegram_app.bot.send_audio(
-                chat_id=TELEGRAM_CHAT_ID, audio=f, caption=caption, reply_to_message_id=reply_to
+                chat_id=TELEGRAM_CHAT_ID, audio=f, caption=caption,
+                reply_to_message_id=reply_to, parse_mode=parse_mode,
             )
         else:
             return await telegram_app.bot.send_document(
-                chat_id=TELEGRAM_CHAT_ID, document=f, caption=caption, reply_to_message_id=reply_to
+                chat_id=TELEGRAM_CHAT_ID, document=f, caption=caption,
+                reply_to_message_id=reply_to, parse_mode=parse_mode,
             )
 
 
