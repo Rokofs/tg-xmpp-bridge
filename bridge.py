@@ -786,6 +786,10 @@ class XMPPBridge(slixmpp.ClientXMPP):
         клиентский id как есть (не блокируем работу бота навсегда).
         """
         client_id = stanza["id"]
+        if stanza["reply"]["id"]:
+            # ВРЕМЕННАЯ ДИАГНОСТИКА: печатаем ровно то, что реально уходит
+            # на сервер, когда это reply — чтобы исключить любые сюрпризы.
+            logger.info("ДИАГНОСТИКА: отправляю reply-стензу:\n%s", str(stanza))
         future = None
         if XMPP_IS_MUC:
             future = asyncio.get_event_loop().create_future()
@@ -794,7 +798,10 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if future is None:
             return client_id
         try:
-            return await asyncio.wait_for(future, timeout=8)
+            resolved = await asyncio.wait_for(future, timeout=8)
+            if stanza["reply"]["id"]:
+                logger.info("ДИАГНОСТИКА: подтверждённый канонический id = %s", resolved)
+            return resolved
         except asyncio.TimeoutError:
             self._pending_echo_futures.pop(client_id, None)
             logger.warning(
