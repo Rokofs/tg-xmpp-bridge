@@ -34,6 +34,10 @@ Discord, и мост будет работать для оставшейся п�
   тоже как настоящий reply (XEP-0461 для XMPP, reply_to_message_id
   для Telegram, MessageReference для Discord), а не просто текстом с
   цитатой.
+- Ответ ОДНИМ эмодзи (или несколькими) на пересланное сообщение
+  считается реакцией, а не обычным ответом — удобно, если в клиенте
+  нет отдельной кнопки для реакций (например, в некоторых версиях
+  Monocles Chat поддержка XEP-0444 ограничена).
 
 УСТАНОВКА
 ---------
@@ -74,6 +78,7 @@ import asyncio
 import itertools
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -268,6 +273,47 @@ def _get_reply_targets(origin: str, replied_native_id) -> dict:
     return {k: v for k, v in record.items() if k in ("tg", "xmpp", "discord") and v is not None}
 
 
+def _get_reply_key(origin: str, replied_native_id) -> Optional[str]:
+    """То же, что _get_reply_targets, но возвращает сам bridge key (для реакций)."""
+    if replied_native_id is None:
+        return None
+    _prune_bridge_records()
+    lookup = {"tg": _tg_lookup, "xmpp": _xmpp_lookup, "discord": _discord_lookup}[origin]
+    return lookup.get(replied_native_id)
+
+
+# Простое (не идеальное) распознавание "текст состоит только из эмодзи" —
+# без внешней зависимости на пакет `emoji`. Покрывает подавляющее
+# большинство современных эмодзи (включая ZWJ-последовательности и
+# variation selector), но не претендует на 100% полноту юникода.
+_EMOJI_ONLY_RE = re.compile(
+    r"^[\s\u2600-\u27BF\U0001F000-\U0001FFFF\u2190-\u21FF\u2300-\u23FF\uFE0F\u200D]+$"
+)
+
+
+def _is_emoji_only(text: str) -> bool:
+    text = (text or "").strip()
+    if not text:
+        return False
+    return bool(_EMOJI_ONLY_RE.match(text))
+
+
+def _extract_emojis(text: str) -> set:
+    """Пытается разбить текст на отдельные эмодзи через пакет `emoji`
+    (если установлен), иначе просто возвращает весь текст одним
+    элементом множества — этого достаточно для типичного случая
+    "ответ одним эмодзи".
+    """
+    try:
+        import emoji as emoji_lib
+        found = {m["emoji"] for m in emoji_lib.emoji_list(text)}
+        if found:
+            return found
+    except ImportError:
+        pass
+    return {text.strip()}
+
+
 # Модульные ссылки на "живые" мосты — заполняются в main(), используются
 # отовсюду для кросс-пересылки без сложных циклических зависимостей.
 telegram_app: Optional[Application] = None
@@ -400,11 +446,21 @@ class XMPPBridge(slixmpp.ClientXMPP):
             return
 
         # --- обычное новое сообщение ---
+        reply_id = msg["reply"]["id"] or None
+
+        # Ответ одним (или несколькими) эмодзи на пересланное сообщение —
+        # считаем это реакцией, а не обычным ответом (полезно, если в
+        # клиенте нет отдельной кнопки для реакций).
+        if reply_id and body and not oob_url and _is_emoji_only(body):
+            reaction_key = _get_reply_key("xmpp", reply_id)
+            if reaction_key:
+                await _mirror_reactions(reaction_key, _extract_emojis(body), skip="xmpp")
+                return
+
         text = f"{sender}: {oob_url}" if oob_url and not body else f"{sender}: {body}"
         if oob_url and body and body != oob_url:
             text = f"{sender}: {body}\n{oob_url}"
 
-        reply_id = msg["reply"]["id"] or None
         reply_targets = _get_reply_targets("xmpp", reply_id) if reply_id else {}
 
         key = _new_bridge_record()
@@ -565,6 +621,14 @@ class DiscordBridge(_DiscordBase):
         author = message.author.display_name
 
         replied_id = message.reference.message_id if message.reference else None
+
+        # Ответ одним эмодзи на пересланное сообщение — считаем реакцией.
+        if replied_id and message.content and not message.attachments and _is_emoji_only(message.content):
+            reaction_key = _get_reply_key("discord", replied_id)
+            if reaction_key:
+                await _mirror_reactions(reaction_key, _extract_emojis(message.content), skip="discord")
+                return
+
         reply_targets = _get_reply_targets("discord", replied_id) if replied_id else {}
 
         # --- вложения ---
@@ -795,6 +859,14 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     has_media = any(getattr(msg, attr, None) for attr in _MEDIA_ATTRS)
 
     replied_id = msg.reply_to_message.message_id if msg.reply_to_message else None
+
+    # Ответ одним эмодзи на пересланное сообщение — считаем реакцией.
+    if replied_id and msg.text and not has_media and _is_emoji_only(msg.text):
+        reaction_key = _get_reply_key("tg", replied_id)
+        if reaction_key:
+            await _mirror_reactions(reaction_key, _extract_emojis(msg.text), skip="tg")
+            return
+
     reply_targets = _get_reply_targets("tg", replied_id) if replied_id else {}
 
     # --- чистый текст, без вложений ---
