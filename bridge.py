@@ -61,12 +61,20 @@ Discord, и мост будет работать для оставшейся п�
   наборов — запускайте несколько экземпляров с разными переменными.
 - Файлы > 20 МБ Telegram Bot API не отдаёт ботам (ограничение самого
   Telegram) — при превышении лимита бот пишет об этом текстом.
-- Редактирование и реакции поддерживаются только для обычного текста
-  (не для подписей к медиа и не для самих файлов).
+- Редактирование (правка текста) поддерживается только для обычного
+  текста — не для подписей к медиа и не для самих файлов. Реакции же
+  теперь работают и на медиа-сообщениях тоже (фото, видео, кружки,
+  голосовые, документы, стикеры).
 - Реакция "от нескольких разных людей одновременно" не агрегируется
   идеально: если на исходной площадке реагируют несколько человек
   разными эмодзи, на других площадках отражается только последнее
   изменение (не сумма всех реакций).
+- Reply на XMPP-сторону детектируется только если клиент отправителя
+  реализует структурированный XEP-0461 (`<reply id="..."/>`). Судя по
+  всему, Monocles Chat пока просто визуально имитирует цитату текстом
+  в теле сообщения, без структурированной пометки — в этом случае
+  мост не может понять, что это ответ именно на конкретное сообщение,
+  и пересылает как обычный текст (с этой цитатой внутри).
 - Ответы (reply) работают, только если исходное сообщение (на которое
   отвечают) было переслано мостом, то есть связка для него ещё жива
   в памяти (см. MESSAGE_MAP_TTL_SECONDS ниже). Ответ на что-то более
@@ -507,12 +515,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
         # --- обычное новое сообщение ---
         reply_id = msg["reply"]["id"] or None
 
-        # ВРЕМЕННАЯ ДИАГНОСТИКА: если тело похоже на цитату ("> ..."),
-        # но структурированный reply (XEP-0461) не распознан — печатаем
-        # сырой XML стензы в лог, чтобы понять, что реально шлёт клиент.
-        if not reply_id and body.startswith(">"):
-            logger.info("ДИАГНОСТИКА: похоже на цитату без XEP-0461 reply. Сырой XML:\n%s", str(msg))
-
         # Ответ одним (или несколькими) эмодзи на пересланное сообщение —
         # считаем это реакцией, а не обычным ответом (полезно, если в
         # клиенте нет отдельной кнопки для реакций).
@@ -632,18 +634,22 @@ class XMPPBridge(slixmpp.ClientXMPP):
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
         await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
 
-    async def send_file(self, filepath: Path, caption: str = "", reply_to: Optional[str] = None) -> None:
-        """Загружает файл на XMPP-сервер (XEP-0363) и отправляет ссылку с OOB."""
+    async def send_file(
+        self, filepath: Path, caption: str = "", reply_to: Optional[str] = None
+    ) -> Optional[str]:
+        """Загружает файл на XMPP-сервер (XEP-0363) и отправляет ссылку с OOB.
+
+        Возвращает id отправленной станзы (для правок/реакций/reply),
+        либо None, если файл вообще не удалось отправить.
+        """
         try:
             url = await self["xep_0363"].upload_file(str(filepath))
         except UploadServiceNotFound:
             logger.warning("На XMPP-сервере не найден сервис HTTP Upload")
-            await self.send_text(f"{caption} (сервер не поддерживает загрузку файлов)".strip())
-            return
+            return await self.send_text(f"{caption} (сервер не поддерживает загрузку файлов)".strip())
         except FileTooBig as e:
             logger.warning("Файл слишком большой для загрузки: %s", e)
-            await self.send_text(f"{caption} (файл слишком большой для XMPP-сервера)".strip())
-            return
+            return await self.send_text(f"{caption} (файл слишком большой для XMPP-сервера)".strip())
         except HTTPError as e:
             # Некоторые серверы (замечено на xmpp.jp) отклоняют PUT для
             # определённых расширений (например, видео/gif) с 405.
@@ -657,22 +663,18 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 logger.info("Обходной путь сработал — файл загружен под нейтральным расширением")
             except Exception:
                 logger.exception("Обходной путь тоже не сработал — сервер отклоняет файл")
-                await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
-                return
+                return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
             finally:
                 renamed.unlink(missing_ok=True)
         except IqError as e:
             logger.exception("Ошибка загрузки файла на XMPP-сервер")
-            await self.send_text(f"{caption} (ошибка загрузки файла: {e})".strip())
-            return
+            return await self.send_text(f"{caption} (ошибка загрузки файла: {e})".strip())
         except IqTimeout as e:
             logger.exception("Таймаут при загрузке файла на XMPP-сервер")
-            await self.send_text(f"{caption} (таймаут при загрузке файла: {e})".strip())
-            return
+            return await self.send_text(f"{caption} (таймаут при загрузке файла: {e})".strip())
         except OSError as e:
             logger.exception("Сетевая ошибка при загрузке файла на XMPP-сервер")
-            await self.send_text(f"{caption} (сетевая ошибка при загрузке файла: {e})".strip())
-            return
+            return await self.send_text(f"{caption} (сетевая ошибка при загрузке файла: {e})".strip())
 
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         body = f"{caption}\n{url}".strip() if caption else url
@@ -682,6 +684,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
             stanza["reply"]["id"] = reply_to
             stanza["reply"]["to"] = XMPP_PEER_JID
         stanza.send()
+        return stanza["id"]
 
 
 # ========================================================================
@@ -773,6 +776,7 @@ class DiscordBridge(_DiscordBase):
             return
 
         # --- вложения ---
+        has_attachments = bool(message.attachments)
         for attachment in message.attachments:
             caption = f"{author}: {message.content}" if message.content else author
             try:
@@ -780,24 +784,29 @@ class DiscordBridge(_DiscordBase):
             except Exception:
                 logger.exception("Не удалось скачать вложение из Discord")
                 continue
+            key = _new_bridge_record(discord=message.id)
             try:
                 if xmpp_bridge:
                     try:
-                        await xmpp_bridge.send_file(
+                        xmpp_id = await xmpp_bridge.send_file(
                             local_path, caption=caption, reply_to=reply_targets.get("xmpp")
                         )
+                        if xmpp_id:
+                            _link_record(key, xmpp=xmpp_id)
                     except Exception:
                         logger.exception("Не удалось переслать вложение из Discord в XMPP")
                 if telegram_app:
                     try:
-                        await _tg_send_file(local_path, caption, reply_to=reply_targets.get("tg"))
+                        sent = await _tg_send_file(local_path, caption, reply_to=reply_targets.get("tg"))
+                        if sent is not None:
+                            _link_record(key, tg=sent.message_id)
                     except Exception:
                         logger.exception("Не удалось переслать вложение из Discord в Telegram")
             finally:
                 local_path.unlink(missing_ok=True)
 
-        # --- текст ---
-        if not message.content:
+        # --- текст (только если не было вложений — иначе текст уже ушёл как подпись) ---
+        if has_attachments or not message.content:
             return
         text = f"{author}: {message.content}"
         key = _new_bridge_record(discord=message.id)
@@ -1113,20 +1122,27 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     local_path = TMP_DIR / f"{file_obj.file_unique_id}{suffix}"
+    key = _new_bridge_record(tg=msg.message_id)
     try:
         await file_obj.download_to_drive(custom_path=str(local_path))
         if is_static_sticker:
             local_path = _convert_static_sticker_to_png(local_path)
         if xmpp_bridge:
             try:
-                await xmpp_bridge.send_file(local_path, caption=caption, reply_to=reply_targets.get("xmpp"))
+                xmpp_id = await xmpp_bridge.send_file(
+                    local_path, caption=caption, reply_to=reply_targets.get("xmpp")
+                )
+                if xmpp_id:
+                    _link_record(key, xmpp=xmpp_id)
             except Exception:
                 logger.exception("Не удалось переслать медиа из Telegram в XMPP")
         if discord_bridge:
             try:
-                await discord_bridge.send_file(
+                discord_id = await discord_bridge.send_file(
                     local_path, caption=caption, reply_to=reply_targets.get("discord")
                 )
+                if discord_id:
+                    _link_record(key, discord=discord_id)
             except Exception:
                 logger.exception("Не удалось переслать медиа из Telegram в Discord")
     except Exception:
