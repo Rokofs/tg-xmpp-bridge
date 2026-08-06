@@ -102,6 +102,17 @@ Discord, и мост будет работать для оставшейся п�
 - Файлы с XMPP-стороны (в т.ч. голосовые) скачиваются и пересылаются
   как настоящие вложения; если скачать по ссылке не удалось (например,
   сервер требует авторизацию) — пересылается просто ссылкой.
+- У каждого автора (по стабильному id — Telegram user id, Discord user
+  id или XMPP-нику) появляется свой цветной значок из набора
+  🔴🟠🟡🟢🔵🟣⚫️⚪️🟤🔺🔻🔸🔹🔶🔷🔳🔲🟥🟧🟨🟩🟦🟪⬛️⬜️🟫, который
+  ставится перед именем при пересылке на другие площадки — так легче
+  различать, кто пишет, на площадках без аватарок/цветных ников.
+- Reply из Telegram/Discord корректно формируется по спецификации
+  XEP-0461 (проверено сверкой сырого XML), но не отображается как
+  визуальный reply ВНУТРИ самого Monocles Chat — похоже на ограничение
+  конкретно этого клиента в части отрисовки входящих reply от других
+  участников комнаты (составление и приём reply от Monocles к другим
+  площадкам работает нормально).
 """
 
 import asyncio
@@ -215,6 +226,29 @@ _bridge_records: dict = {}   # key -> {"tg": int|None, "xmpp": str|None, "discor
 _tg_lookup: dict = {}        # tg_message_id -> key
 _xmpp_lookup: dict = {}      # xmpp_stanza_id -> key
 _discord_lookup: dict = {}   # discord_message_id -> key
+
+
+# ------------------------------------------------------------------------
+# Цветные метки авторов — у каждого нового автора (по стабильному ключу
+# платформа+id) появляется свой цветной значок, который потом всегда
+# ставится рядом с его именем при пересылке на другие площадки.
+# ------------------------------------------------------------------------
+_COLOR_EMOJIS = [
+    "🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚫️", "⚪️", "🟤",
+    "🔺", "🔻", "🔸", "🔹", "🔶", "🔷", "🔳", "🔲",
+    "🟥", "🟧", "🟨", "🟩", "🟦", "🟪", "⬛️", "⬜️", "🟫",
+]
+_author_colors: dict = {}
+_color_counter = itertools.count(0)
+
+
+def _colored_author(key: str, display_name: str) -> str:
+    """Возвращает "значок Имя" — значок стабильно закреплён за key
+    (например, "tg:12345" или "discord:98765" или "xmpp:nick")."""
+    if key not in _author_colors:
+        idx = next(_color_counter) % len(_COLOR_EMOJIS)
+        _author_colors[key] = _COLOR_EMOJIS[idx]
+    return f"{_author_colors[key]} {display_name}"
 
 
 def _own_xmpp_reply_jid() -> str:
@@ -468,8 +502,12 @@ def _format_from_telegram_html(html_text: str, target: str) -> str:
                 self.out.append("```")
             elif tag == "a":
                 href = attrs_dict.get("href", "")
-                self.tag_stack.append(("a", href))
-                if target == "discord":
+                # tg://user?id=... — упоминание пользователя без username
+                # (и вообще любые внутренние tg:// ссылки). Они нерабочие
+                # за пределами Telegram — не дописываем их в скобках.
+                is_internal = href.startswith("tg://")
+                self.tag_stack.append(("a", (href, is_internal)))
+                if target == "discord" and not is_internal:
                     self.out.append("[")
             elif tag == "blockquote":
                 self.tag_stack.append(("blockquote", ""))
@@ -486,8 +524,10 @@ def _format_from_telegram_html(html_text: str, target: str) -> str:
                 return
             _open_tag, marker = self.tag_stack.pop()
             if _open_tag == "a":
-                href = marker
-                if target == "discord":
+                href, is_internal = marker
+                if is_internal:
+                    pass  # оставляем голый текст метки, без ссылки
+                elif target == "discord":
                     self.out.append(f"]({href})")
                 elif href:
                     self.out.append(f" ({href})")
@@ -829,6 +869,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
             return
 
         sender = str(msg["mucnick"]) if XMPP_IS_MUC else str(msg["from"].bare)
+        display_sender = _colored_author(f"xmpp:{sender}", sender)
 
         # --- это исправление ранее отправленного сообщения ---
         if correction_id:
@@ -843,7 +884,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 )
                 return
 
-            text = f"{sender}: {body} (ред.)"
+            text = f"{display_sender}: {body} (ред.)"
             if telegram_app and record.get("tg"):
                 try:
                     await telegram_app.bot.edit_message_text(
@@ -927,10 +968,12 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if local_path is not None:
             base = effective_body if effective_body and effective_body != oob_url else ""
             caption_tg = (
-                f"{_html_escape(sender, quote=False)}: {_convert_markup(base, 'xmpp', 'telegram')}"
-                if base else _html_escape(sender, quote=False)
+                f"{_html_escape(display_sender, quote=False)}: {_convert_markup(base, 'xmpp', 'telegram')}"
+                if base else _html_escape(display_sender, quote=False)
             )
-            caption_discord = f"{sender}: {_convert_markup(base, 'xmpp', 'discord')}" if base else sender
+            caption_discord = (
+                f"{display_sender}: {_convert_markup(base, 'xmpp', 'discord')}" if base else display_sender
+            )
             try:
                 if telegram_app:
                     try:
@@ -955,17 +998,20 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
         # --- нет вложения (или не удалось скачать) — обычный текст/ссылка ---
         if oob_url and not effective_body:
-            text_tg = f"{_html_escape(sender, quote=False)}: {_html_escape(oob_url, quote=False)}"
-            text_discord = f"{sender}: {oob_url}"
+            text_tg = f"{_html_escape(display_sender, quote=False)}: {_html_escape(oob_url, quote=False)}"
+            text_discord = f"{display_sender}: {oob_url}"
         else:
             converted_tg = _convert_markup(effective_body, "xmpp", "telegram")
             converted_discord = _convert_markup(effective_body, "xmpp", "discord")
             if oob_url and effective_body != oob_url:
-                text_tg = f"{_html_escape(sender, quote=False)}: {converted_tg}\n{_html_escape(oob_url, quote=False)}"
-                text_discord = f"{sender}: {converted_discord}\n{oob_url}"
+                text_tg = (
+                    f"{_html_escape(display_sender, quote=False)}: {converted_tg}\n"
+                    f"{_html_escape(oob_url, quote=False)}"
+                )
+                text_discord = f"{display_sender}: {converted_discord}\n{oob_url}"
             else:
-                text_tg = f"{_html_escape(sender, quote=False)}: {converted_tg}"
-                text_discord = f"{sender}: {converted_discord}"
+                text_tg = f"{_html_escape(display_sender, quote=False)}: {converted_tg}"
+                text_discord = f"{display_sender}: {converted_discord}"
 
         if telegram_app:
             try:
@@ -1126,7 +1172,7 @@ class DiscordBridge(_DiscordBase):
         if message.channel.id != DISCORD_CHANNEL_ID:
             return
 
-        author = message.author.display_name
+        author = _colored_author(f"discord:{message.author.id}", message.author.display_name)
 
         replied_id = message.reference.message_id if message.reference else None
 
@@ -1424,7 +1470,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if msg.from_user and msg.from_user.is_bot:
         return
 
-    author = msg.from_user.first_name if msg.from_user else "Telegram"
+    author = _colored_author(
+        f"tg:{msg.from_user.id}" if msg.from_user else "tg:unknown",
+        msg.from_user.first_name if msg.from_user else "Telegram",
+    )
     has_media = any(getattr(msg, attr, None) for attr in _MEDIA_ATTRS)
 
     replied_id = msg.reply_to_message.message_id if msg.reply_to_message else None
@@ -1604,7 +1653,10 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
-    author = msg.from_user.first_name if msg.from_user else "Telegram"
+    author = _colored_author(
+        f"tg:{msg.from_user.id}" if msg.from_user else "tg:unknown",
+        msg.from_user.first_name if msg.from_user else "Telegram",
+    )
 
     if xmpp_bridge and record.get("xmpp"):
         try:
