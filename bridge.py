@@ -1300,16 +1300,22 @@ class DiscordBridge(_DiscordBase):
         if not record or time.monotonic() - record["ts"] > EDIT_WINDOW_SECONDS:
             return
 
-        text = f"{after.author.display_name}: {after.content}"
+        author = _colored_author(f"discord:{after.author.id}", after.author.display_name)
+        xmpp_text = f"{author}: {_convert_markup(after.content, 'discord', 'xmpp')} (ред.)"
+        tg_text = (
+            f"{_html_escape(author, quote=False)}: "
+            f"{_convert_markup(after.content, 'discord', 'telegram')} (ред.)"
+        )
+
         if xmpp_bridge and record.get("xmpp"):
             try:
-                await xmpp_bridge.send_correction(text, record["xmpp"])
+                await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
             except Exception:
                 logger.exception("Не удалось переслать исправление в XMPP")
         if telegram_app and record.get("tg"):
             try:
                 await telegram_app.bot.edit_message_text(
-                    chat_id=TELEGRAM_CHAT_ID, message_id=record["tg"], text=text
+                    chat_id=TELEGRAM_CHAT_ID, message_id=record["tg"], text=tg_text, parse_mode="HTML",
                 )
             except BadRequest as e:
                 if "not modified" not in str(e).lower():
@@ -1660,13 +1666,13 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
 
     if xmpp_bridge and record.get("xmpp"):
         try:
-            xmpp_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'xmpp')}"
+            xmpp_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'xmpp')} (ред.)"
             await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
         except Exception:
             logger.exception("Не удалось переслать исправление в XMPP")
     if discord_bridge and record.get("discord"):
         try:
-            discord_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'discord')}"
+            discord_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'discord')} (ред.)"
             await discord_bridge.send_correction(record["discord"], discord_text)
         except Exception:
             logger.exception("Не удалось переслать исправление в Discord")
