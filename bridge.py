@@ -112,7 +112,10 @@ Discord, и мост будет работать для оставшейся п�
   визуальный reply ВНУТРИ самого Monocles Chat — похоже на ограничение
   конкретно этого клиента в части отрисовки входящих reply от других
   участников комнаты (составление и приём reply от Monocles к другим
-  площадкам работает нормально).
+  площадкам работает нормально). Как запасной вариант, рядом со
+  структурированным reply в XMPP теперь дублируется текстовая цитата
+  ("> текст оригинала\nАвтор: ответ") — её увидит любой клиент,
+  независимо от поддержки XEP-0461.
 """
 
 import asyncio
@@ -355,6 +358,23 @@ def _get_reply_key(origin: str, replied_native_id) -> Optional[str]:
     _prune_bridge_records()
     lookup = {"tg": _tg_lookup, "xmpp": _xmpp_lookup, "discord": _discord_lookup}[origin]
     return lookup.get(replied_native_id)
+
+
+def _get_xmpp_quote_preview(origin: str, replied_native_id) -> Optional[str]:
+    """Возвращает короткий текстовый превью сообщения, на которое отвечают,
+    чтобы вставить его цитатой ("> ...") в само тело XMPP-сообщения —
+    "по старинке", для клиентов вроде Monocles Chat, которые не рисуют
+    структурированный XEP-0461 reply как настоящий ответ."""
+    key = _get_reply_key(origin, replied_native_id)
+    if not key:
+        return None
+    for k, text, _ts in reversed(_recent_xmpp_texts):
+        if k == key:
+            snippet = text.strip().replace("\n", " ")
+            if len(snippet) > 150:
+                snippet = snippet[:150].rstrip() + "…"
+            return snippet
+    return None
 
 
 # ------------------------------------------------------------------------
@@ -871,6 +891,12 @@ class XMPPBridge(slixmpp.ClientXMPP):
         sender = str(msg["mucnick"]) if XMPP_IS_MUC else str(msg["from"].bare)
         display_sender = _colored_author(f"xmpp:{sender}", sender)
 
+        # ВРЕМЕННАЯ ДИАГНОСТИКА: если структурированная правка (XEP-0308)
+        # не распознана — печатаем сырой XML, чтобы понять, что реально
+        # шлёт клиент при редактировании (аналогично истории с reply).
+        if not correction_id:
+            logger.info("ДИАГНОСТИКА: сообщение без распознанной правки. Сырой XML:\n%s", str(msg))
+
         # --- это исправление ранее отправленного сообщения ---
         if correction_id:
             _prune_bridge_records()
@@ -884,11 +910,19 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 )
                 return
 
-            text = f"{display_sender}: {body} (ред.)"
+            # Discord сам показывает пометку "(edited)" при вызове .edit() —
+            # свою дописывать не нужно. Telegram для правок от ботов такую
+            # пометку не показывает вообще — дописываем текстом сами.
+            text_tg = (
+                f"{_html_escape(display_sender, quote=False)}: "
+                f"{_convert_markup(body, 'xmpp', 'telegram')} (ред.)"
+            )
+            text_discord = f"{display_sender}: {_convert_markup(body, 'xmpp', 'discord')}"
+
             if telegram_app and record.get("tg"):
                 try:
                     await telegram_app.bot.edit_message_text(
-                        chat_id=TELEGRAM_CHAT_ID, message_id=record["tg"], text=text
+                        chat_id=TELEGRAM_CHAT_ID, message_id=record["tg"], text=text_tg, parse_mode="HTML",
                     )
                 except BadRequest as e:
                     if "not modified" not in str(e).lower():
@@ -897,7 +931,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
                     logger.exception("Не удалось применить исправление в Telegram")
             if discord_bridge and record.get("discord"):
                 try:
-                    await discord_bridge.send_correction(record["discord"], text)
+                    await discord_bridge.send_correction(record["discord"], text_discord)
                 except Exception:
                     logger.exception("Не удалось применить исправление в Discord")
             return
@@ -1220,6 +1254,7 @@ class DiscordBridge(_DiscordBase):
 
         # --- вложения ---
         has_attachments = bool(message.attachments)
+        _quote = _get_xmpp_quote_preview("discord", replied_id) if replied_id else None
         for attachment in message.attachments:
             if message.content:
                 caption_xmpp = f"{author}: {_convert_markup(message.content, 'discord', 'xmpp')}"
@@ -1230,6 +1265,8 @@ class DiscordBridge(_DiscordBase):
             else:
                 caption_xmpp = author
                 caption_tg = _html_escape(author, quote=False)
+            if _quote:
+                caption_xmpp = f"> {_quote}\n{caption_xmpp}"
             try:
                 local_path = await _download_discord_attachment(attachment)
             except Exception:
@@ -1263,6 +1300,10 @@ class DiscordBridge(_DiscordBase):
         if has_attachments or not message.content:
             return
         xmpp_text = f"{author}: {_convert_markup(message.content, 'discord', 'xmpp')}"
+        if replied_id:
+            _quote = _get_xmpp_quote_preview("discord", replied_id)
+            if _quote:
+                xmpp_text = f"> {_quote}\n{xmpp_text}"
         tg_text = f"{_html_escape(author, quote=False)}: {_convert_markup(message.content, 'discord', 'telegram')}"
         key = _new_bridge_record(discord=message.id)
 
@@ -1526,6 +1567,9 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if xmpp_bridge:
             try:
                 xmpp_full_text = f"{author}: {xmpp_body}"
+                _quote = _get_xmpp_quote_preview("tg", replied_id) if replied_id else None
+                if _quote:
+                    xmpp_full_text = f"> {_quote}\n{xmpp_full_text}"
                 xmpp_id = await xmpp_bridge.send_text(
                     xmpp_full_text, reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to")
                 )
@@ -1550,6 +1594,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     caption_discord = (
         f"{author}: {_format_tg_text(msg.caption, msg.caption_html, 'discord')}" if msg.caption else author
     )
+    if replied_id:
+        _quote = _get_xmpp_quote_preview("tg", replied_id)
+        if _quote:
+            caption_xmpp = f"> {_quote}\n{caption_xmpp}"
 
     file_obj = None
     suffix = ""
@@ -1672,7 +1720,9 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
             logger.exception("Не удалось переслать исправление в XMPP")
     if discord_bridge and record.get("discord"):
         try:
-            discord_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'discord')} (ред.)"
+            # Discord сам показывает "(edited)" при вызове .edit() — свою
+            # пометку дописывать не нужно.
+            discord_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'discord')}"
             await discord_bridge.send_correction(record["discord"], discord_text)
         except Exception:
             logger.exception("Не удалось переслать исправление в Discord")
