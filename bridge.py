@@ -1551,14 +1551,52 @@ async def _minecraft_power_action(signal: str) -> tuple:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json={"signal": signal}) as resp:
+                body = await resp.text()
+                logger.info(
+                    "Minecraft power-action ответ: HTTP %s, тело (первые 300 симв.): %s",
+                    resp.status, body[:300],
+                )
                 if resp.status in (200, 204):
                     return True, "команда отправлена"
-                body = await resp.text()
                 clean_body = re.sub(r"<[^>]+>", "", body).strip()
                 return False, f"HTTP {resp.status}: {clean_body[:300]}"
     except Exception as e:
         logger.exception("Ошибка запроса к панели Minecraft (Rustix/Pterodactyl)")
         return False, str(e)
+
+
+async def _minecraft_get_status() -> tuple:
+    """Запрашивает текущее состояние сервера (для диагностики /mcstart)."""
+    import aiohttp
+
+    url = f"{MINECRAFT_PANEL_URL}/api/client/servers/{MINECRAFT_SERVER_ID}/resources"
+    headers = {
+        "Authorization": f"Bearer {MINECRAFT_API_KEY}",
+        "Accept": "Application/vnd.pterodactyl.v1+json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Origin": MINECRAFT_PANEL_URL,
+        "Referer": f"{MINECRAFT_PANEL_URL}/server/{MINECRAFT_SERVER_ID}/console",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                body = await resp.text()
+                logger.info(
+                    "Minecraft status-запрос ответ: HTTP %s, тело (первые 300 симв.): %s",
+                    resp.status, body[:300],
+                )
+                if resp.status != 200:
+                    return None, f"HTTP {resp.status}"
+                import json as _json
+                data = _json.loads(body)
+                state = data.get("attributes", {}).get("current_state")
+                return state, None
+    except Exception as e:
+        logger.exception("Ошибка запроса статуса Minecraft-сервера")
+        return None, str(e)
 
 
 async def tg_handle_mcstart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1567,11 +1605,22 @@ async def tg_handle_mcstart(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if chat is None:
         return
     ok, detail = await _minecraft_power_action("start")
-    if ok:
-        await context.bot.send_message(chat_id=chat.id, text="🟢 Сервер запускается...")
-    else:
+    if not ok:
         await context.bot.send_message(chat_id=chat.id, text=f"⚠️ Не удалось запустить сервер: {detail}")
         logger.warning("Не удалось запустить Minecraft-сервер: %s", detail)
+        return
+
+    await asyncio.sleep(2)  # даём панели секунду обновить статус
+    state, err = await _minecraft_get_status()
+    if err:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"🟢 Команда отправлена, но не удалось проверить статус ({err}).",
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat.id, text=f"🟢 Команда отправлена. Текущий статус: `{state}`", parse_mode="Markdown"
+        )
 
 # ========================= /MINECRAFT ======================================
 
