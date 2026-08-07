@@ -1935,6 +1935,7 @@ async def _start_healthcheck_server():
 # _start_minecraft_afk_bot() / _stop_minecraft_afk_bot() в main().
 
 _minecraft_afk_process = None
+_minecraft_afk_shutting_down = False
 
 
 MC_CHAT_BRIDGE_ENABLED = bool(os.environ.get("MC_HOST"))
@@ -1955,10 +1956,19 @@ async def _start_minecraft_afk_bot():
     env = os.environ.copy()
     env.pop("PORT", None)
 
+    # Ограничиваем кучу V8 у Node — на бесплатных тарифах (обычно 512 МБ
+    # на весь контейнер) без этого Node может незаметно вырасти и увести
+    # в OOM-килл ВЕСЬ контейнер целиком (вместе с Python-частью моста).
+    # С лимитом упадёт только сам Node-процесс — переподключится по
+    # своей же логике реконнекта, а не потащит за собой всё остальное.
+    # При необходимости поправьте под свой тариф Render через
+    # MC_NODE_MAX_OLD_SPACE_MB (в мегабайтах).
+    max_heap_mb = os.environ.get("MC_NODE_MAX_OLD_SPACE_MB", "160")
+
     logger.info("Запускаю AFK-бота Minecraft (Node.js/mineflayer)...")
     try:
         _minecraft_afk_process = await asyncio.create_subprocess_exec(
-            "node", "index.js",
+            "node", f"--max-old-space-size={max_heap_mb}", "index.js",
             cwd=afk_dir,
             env=env,
             stdin=asyncio.subprocess.PIPE,
@@ -1966,6 +1976,7 @@ async def _start_minecraft_afk_bot():
             stderr=asyncio.subprocess.STDOUT,
         )
         asyncio.create_task(_pipe_minecraft_afk_logs())
+        asyncio.create_task(_watch_minecraft_afk_process())
     except FileNotFoundError:
         logger.error(
             "Не удалось запустить AFK-бота: команда 'node' не найдена. "
@@ -2041,7 +2052,27 @@ async def _send_to_minecraft_chat(text: str) -> None:
         logger.exception("Не удалось отправить сообщение в Minecraft-чат")
 
 
+async def _watch_minecraft_afk_process() -> None:
+    """Если Node-подпроцесс неожиданно завершился (например, упёрся в
+    лимит памяти) — перезапускаем его заново через паузу, а не
+    оставляем мёртвым до следующего деплоя."""
+    process = _minecraft_afk_process
+    if process is None:
+        return
+    returncode = await process.wait()
+    if _minecraft_afk_shutting_down:
+        return  # это штатная остановка при выключении бота, не ошибка
+    logger.warning(
+        "AFK-бот Minecraft неожиданно завершился (код %s) — перезапускаю через 10 сек",
+        returncode,
+    )
+    await asyncio.sleep(10)
+    await _start_minecraft_afk_bot()
+
+
 async def _stop_minecraft_afk_bot():
+    global _minecraft_afk_shutting_down
+    _minecraft_afk_shutting_down = True
     if _minecraft_afk_process is None:
         return
     try:
