@@ -265,6 +265,21 @@ def _colored_author(key: str, display_name: str) -> str:
     return f"{_author_colors[key]} {display_name}"
 
 
+def _mc_media_label(suffix: str) -> str:
+    """Короткая текстовая метка типа файла для уведомления в Minecraft-чате
+    (без эмодзи — игровой шрифт их не рисует)."""
+    suffix = (suffix or "").lower()
+    if suffix in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        return "[фото]"
+    if suffix in (".mp4", ".mov", ".webm"):
+        return "[видео]"
+    if suffix in (".mp3", ".ogg", ".oga", ".wav", ".m4a", ".opus"):
+        return "[аудио]"
+    if suffix in (".tgs",):
+        return "[анимированный стикер]"
+    return "[файл]"
+
+
 def _own_xmpp_reply_jid() -> str:
     """JID, который надо указывать в 'to' у <reply>/<reactions> для
     сообщений, которые в комнату/чат отправил сам бот (не важно, чей
@@ -1037,6 +1052,10 @@ class XMPPBridge(slixmpp.ClientXMPP):
                         _link_record(key, discord=discord_id)
                     except Exception:
                         logger.exception("Не удалось переслать медиа из XMPP в Discord")
+                if MC_CHAT_BRIDGE_ENABLED:
+                    label = _mc_media_label(local_path.suffix)
+                    caption_part = f" {base}" if base else ""
+                    await _send_to_minecraft_chat(f"{sender}: {label}{caption_part}")
             finally:
                 local_path.unlink(missing_ok=True)
             return
@@ -1309,6 +1328,10 @@ class DiscordBridge(_DiscordBase):
                             _link_record(key, tg=sent.message_id)
                     except Exception:
                         logger.exception("Не удалось переслать вложение из Discord в Telegram")
+                if MC_CHAT_BRIDGE_ENABLED:
+                    label = _mc_media_label(local_path.suffix)
+                    caption_part = f" {message.content}" if message.content else ""
+                    await _send_to_minecraft_chat(f"{message.author.display_name}: {label}{caption_part}")
             finally:
                 local_path.unlink(missing_ok=True)
 
@@ -1804,6 +1827,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     _link_record(key, discord=discord_id)
             except Exception:
                 logger.exception("Не удалось переслать медиа из Telegram в Discord")
+        if MC_CHAT_BRIDGE_ENABLED:
+            label = _mc_media_label(local_path.suffix)
+            caption_part = f" {msg.caption}" if msg.caption else ""
+            await _send_to_minecraft_chat(f"{raw_author_name}: {label}{caption_part}")
     except Exception:
         logger.exception("Не удалось скачать медиа из Telegram")
     finally:
