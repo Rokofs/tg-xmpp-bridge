@@ -188,6 +188,17 @@ DISCORD_ENABLED = bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID)
 
 BRIDGE_ENABLED = bool(TELEGRAM_CHAT_ID and (XMPP_ENABLED or DISCORD_ENABLED))
 
+# ============================================================================
+# MINECRAFT (Rustix.me / Pterodactyl) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
+# Чтобы полностью отключить фичу — закомментируйте эти 4 строки (или
+# просто не задавайте MINECRAFT_API_KEY в .env, тогда команда /mcstart
+# сама не зарегистрируется).
+MINECRAFT_PANEL_URL = os.environ.get("MINECRAFT_PANEL_URL", "https://my.rustix.me").strip().rstrip("/")
+MINECRAFT_API_KEY = os.environ.get("MINECRAFT_API_KEY", "").strip() or None
+MINECRAFT_SERVER_ID = os.environ.get("MINECRAFT_SERVER_ID", "").strip() or None
+MINECRAFT_ENABLED = bool(MINECRAFT_API_KEY and MINECRAFT_SERVER_ID)
+# ============================================================================
+
 # Некоторые VPN туннелируют только IPv4, а httpx/anyio по умолчанию
 # сначала пробует IPv6 и подолгу "виснет" — из-за этого TimedOut даже
 # при рабочем интернете. TELEGRAM_FORCE_IPV4=true чинит это.
@@ -1509,6 +1520,51 @@ async def tg_handle_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     logger.info("Команда /chatid: chat_id=%s (%s)", chat.id, title)
 
 
+# ============================================================================
+# MINECRAFT (Rustix.me / Pterodactyl) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
+# Чтобы отключить — удалите/закомментируйте вызов add_handler в main()
+# (см. поиск по "mc_start_command") или просто не задавайте
+# MINECRAFT_API_KEY в .env — тогда команда сама не зарегистрируется.
+
+async def _minecraft_power_action(signal: str) -> tuple:
+    """Отправляет команду power-действия (start/stop/restart/kill) через
+    официальный Client API Pterodactyl. Возвращает (успех: bool, текст).
+    """
+    import aiohttp
+
+    url = f"{MINECRAFT_PANEL_URL}/api/client/servers/{MINECRAFT_SERVER_ID}/power"
+    headers = {
+        "Authorization": f"Bearer {MINECRAFT_API_KEY}",
+        "Accept": "Application/vnd.pterodactyl.v1+json",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json={"signal": signal}) as resp:
+                if resp.status in (200, 204):
+                    return True, "команда отправлена"
+                body = await resp.text()
+                return False, f"HTTP {resp.status}: {body[:300]}"
+    except Exception as e:
+        logger.exception("Ошибка запроса к панели Minecraft (Rustix/Pterodactyl)")
+        return False, str(e)
+
+
+async def tg_handle_mcstart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /mcstart — запускает Minecraft-сервер через панель Rustix.me."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    ok, detail = await _minecraft_power_action("start")
+    if ok:
+        await context.bot.send_message(chat_id=chat.id, text="🟢 Сервер запускается...")
+    else:
+        await context.bot.send_message(chat_id=chat.id, text=f"⚠️ Не удалось запустить сервер: {detail}")
+        logger.warning("Не удалось запустить Minecraft-сервер: %s", detail)
+
+# ========================= /MINECRAFT ======================================
+
+
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает входящие сообщения Telegram и пересылает их в XMPP/Discord."""
     msg = update.effective_message
@@ -1792,6 +1848,10 @@ async def main() -> None:
     telegram_app = builder.build()
 
     telegram_app.add_handler(CommandHandler("chatid", tg_handle_chatid))
+
+    # MINECRAFT: чтобы отключить — удалите/закомментируйте следующие 2 строки.
+    if MINECRAFT_ENABLED:
+        telegram_app.add_handler(CommandHandler("mcstart", tg_handle_mcstart))
 
     allowed_updates = ["message", "edited_message"]
 
