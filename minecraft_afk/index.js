@@ -17,6 +17,16 @@
  * произойдёт, но риск реальный и это ваше осознанное решение,
  * не разработчика скрипта. Сделайте бэкап мира на всякий случай.
  *
+ * ЧАТ-МОСТ
+ * --------
+ * Помимо anti-AFK, бот пересылает игровой чат наружу и обратно через
+ * stdin/stdout — родительский Python-процесс их читает и пишет.
+ * Формат (по одной строке на сообщение):
+ *   Minecraft -> наружу: "MCCHAT_IN:{"username":"...","message":"..."}"
+ *   наружу -> Minecraft: "MCCHAT_OUT:{"text":"..."}"
+ * Если бот запущен не как подпроцесс моста (а сам по себе) — просто
+ * никто не читает/не пишет в эти потоки, ничего не сломается.
+ *
  * НАСТРОЙКА
  * ---------
  * Переменные окружения (задаются в .env локально или в Environment
@@ -34,6 +44,7 @@
 
 const mineflayer = require('mineflayer');
 const http = require('http');
+const readline = require('readline');
 
 let autoEatPlugin = null;
 try {
@@ -150,6 +161,11 @@ function createBot() {
     log('Бота кикнули:', reason);
   });
 
+  bot.on('chat', (username, message) => {
+    if (!bot || username === bot.username) return; // не пересылаем своё же эхо
+    process.stdout.write(`MCCHAT_IN:${JSON.stringify({ username, message })}\n`);
+  });
+
   bot.on('error', (err) => {
     log('Ошибка соединения:', err.message);
   });
@@ -163,6 +179,26 @@ function createBot() {
 }
 
 createBot();
+
+// Принимаем команды на отправку сообщений в игровой чат от Python-моста
+// (если бот запущен как подпроцесс) — по одной JSON-строке за раз с
+// префиксом MCCHAT_OUT:. Если ничего не пишет в stdin — просто никогда
+// не сработает, ничего не сломается.
+const stdinReader = readline.createInterface({ input: process.stdin, terminal: false });
+stdinReader.on('line', (line) => {
+  if (!line.startsWith('MCCHAT_OUT:')) return;
+  if (!bot || !bot.chat) {
+    log('Не могу отправить сообщение в чат — бот сейчас не подключён.');
+    return;
+  }
+  try {
+    const payload = JSON.parse(line.slice('MCCHAT_OUT:'.length));
+    const text = String(payload.text || '').slice(0, 250); // лимит чата Minecraft
+    if (text) bot.chat(text);
+  } catch (e) {
+    log('Не удалось разобрать команду чата от моста:', e.message);
+  }
+});
 
 // Минимальный HTTP-сервер — нужен только для хостингов вроде Render,
 // которым обязательно открыть порт, и чтобы UptimeRobot мог пинговать
