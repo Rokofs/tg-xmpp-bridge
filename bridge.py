@@ -1886,6 +1886,77 @@ async def _start_healthcheck_server():
     return runner
 
 
+# ============================================================================
+# MINECRAFT AFK-БОТ (Node.js/mineflayer) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
+# Держит Minecraft-сервер (например, Aternos) "живым", подключаясь как
+# игрок. Запускается как подпроцесс, чтобы жить в том же Render-сервисе
+# и не тратить отдельный лимит бесплатных часов.
+#
+# Чтобы отключить — не задавайте MC_HOST в .env (тогда подпроцесс просто
+# не стартует), либо удалите/закомментируйте вызовы
+# _start_minecraft_afk_bot() / _stop_minecraft_afk_bot() в main().
+
+_minecraft_afk_process = None
+
+
+async def _start_minecraft_afk_bot():
+    global _minecraft_afk_process
+    if not os.environ.get("MC_HOST"):
+        return  # не настроено — не запускаем
+
+    afk_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minecraft_afk")
+    if not os.path.isdir(afk_dir):
+        logger.warning("Папка minecraft_afk не найдена рядом с bridge.py — AFK-бот не запущен")
+        return
+
+    # Не передаём подпроцессу PORT — порт держит только этот, Python,
+    # процесс (иначе Node попробует занять тот же порт и упадёт).
+    env = os.environ.copy()
+    env.pop("PORT", None)
+
+    logger.info("Запускаю AFK-бота Minecraft (Node.js/mineflayer)...")
+    try:
+        _minecraft_afk_process = await asyncio.create_subprocess_exec(
+            "node", "index.js",
+            cwd=afk_dir,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        asyncio.create_task(_pipe_minecraft_afk_logs())
+    except FileNotFoundError:
+        logger.error(
+            "Не удалось запустить AFK-бота: команда 'node' не найдена. "
+            "Убедитесь, что в окружении установлен Node.js (см. Dockerfile)."
+        )
+    except Exception:
+        logger.exception("Не удалось запустить AFK-бота Minecraft")
+
+
+async def _pipe_minecraft_afk_logs():
+    """Перенаправляет вывод Node-подпроцесса в общий лог Python-процесса,
+    чтобы всё было видно в одном месте на Render."""
+    if _minecraft_afk_process is None or _minecraft_afk_process.stdout is None:
+        return
+    async for line in _minecraft_afk_process.stdout:
+        logger.info("[minecraft-afk] %s", line.decode(errors="replace").rstrip())
+
+
+async def _stop_minecraft_afk_bot():
+    if _minecraft_afk_process is None:
+        return
+    try:
+        _minecraft_afk_process.terminate()
+        await asyncio.wait_for(_minecraft_afk_process.wait(), timeout=5)
+    except Exception:
+        try:
+            _minecraft_afk_process.kill()
+        except Exception:
+            pass
+
+# ========================== /MINECRAFT AFK-БОТ =============================
+
+
 # ========================================================================
 # ЗАПУСК
 # ========================================================================
@@ -1894,6 +1965,7 @@ async def main() -> None:
     global telegram_app, xmpp_bridge, discord_bridge
 
     healthcheck_runner = await _start_healthcheck_server()
+    await _start_minecraft_afk_bot()
 
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
 
@@ -1986,6 +2058,7 @@ async def main() -> None:
                 await discord_bridge.close()
             if healthcheck_runner is not None:
                 await healthcheck_runner.cleanup()
+            await _stop_minecraft_afk_bot()
 
 
 if __name__ == "__main__":
