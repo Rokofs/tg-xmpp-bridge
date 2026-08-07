@@ -16,6 +16,10 @@ RUN apt-get update && \
 
 WORKDIR /app
 
+# Отключаем буферизацию stdout/stderr у Python — иначе строки из
+# AFK-бота (в т.ч. игровой чат) могут задерживаться в буфере.
+ENV PYTHONUNBUFFERED=1
+
 # --- Python-зависимости ---
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

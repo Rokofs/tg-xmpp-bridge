@@ -1075,6 +1075,11 @@ class XMPPBridge(slixmpp.ClientXMPP):
             except Exception:
                 logger.exception("Не удалось переслать сообщение из XMPP в Discord")
 
+        if MC_CHAT_BRIDGE_ENABLED:
+            mc_text = effective_body if effective_body else (oob_url or "")
+            if mc_text:
+                await _send_to_minecraft_chat(f"{sender}: {mc_text}")
+
     async def on_xmpp_reactions(self, msg):
         """Обрабатывает входящие реакции (XEP-0444) и отражает их на других площадках."""
         if not self._is_from_peer(msg):
@@ -1337,6 +1342,9 @@ class DiscordBridge(_DiscordBase):
                 _link_record(key, tg=sent.message_id)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Discord в Telegram")
+
+        if MC_CHAT_BRIDGE_ENABLED:
+            await _send_to_minecraft_chat(f"{message.author.display_name}: {message.content}")
 
     async def on_message_edit(self, before, after):
         if self.user and after.author.id == self.user.id:
@@ -1633,9 +1641,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if msg.from_user and msg.from_user.is_bot:
         return
 
+    raw_author_name = msg.from_user.first_name if msg.from_user else "Telegram"
     author = _colored_author(
         f"tg:{msg.from_user.id}" if msg.from_user else "tg:unknown",
-        msg.from_user.first_name if msg.from_user else "Telegram",
+        raw_author_name,
     )
     has_media = any(getattr(msg, attr, None) for attr in _MEDIA_ATTRS)
 
@@ -1701,6 +1710,8 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _link_record(key, discord=discord_id)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Telegram в Discord")
+        if MC_CHAT_BRIDGE_ENABLED:
+            await _send_to_minecraft_chat(f"{raw_author_name}: {msg.text}")
         return
 
     if not has_media:
@@ -1899,6 +1910,9 @@ async def _start_healthcheck_server():
 _minecraft_afk_process = None
 
 
+MC_CHAT_BRIDGE_ENABLED = bool(os.environ.get("MC_HOST"))
+
+
 async def _start_minecraft_afk_bot():
     global _minecraft_afk_process
     if not os.environ.get("MC_HOST"):
@@ -1920,6 +1934,7 @@ async def _start_minecraft_afk_bot():
             "node", "index.js",
             cwd=afk_dir,
             env=env,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -1934,12 +1949,69 @@ async def _start_minecraft_afk_bot():
 
 
 async def _pipe_minecraft_afk_logs():
-    """Перенаправляет вывод Node-подпроцесса в общий лог Python-процесса,
-    чтобы всё было видно в одном месте на Render."""
+    """Читает stdout Node-подпроцесса: обычные строки — в общий лог,
+    строки с префиксом MCCHAT_IN: — как сообщения игрового чата,
+    которые нужно переслать на остальные площадки."""
     if _minecraft_afk_process is None or _minecraft_afk_process.stdout is None:
         return
-    async for line in _minecraft_afk_process.stdout:
-        logger.info("[minecraft-afk] %s", line.decode(errors="replace").rstrip())
+    async for raw_line in _minecraft_afk_process.stdout:
+        line = raw_line.decode(errors="replace").rstrip()
+        if line.startswith("MCCHAT_IN:"):
+            await _handle_minecraft_chat_message(line[len("MCCHAT_IN:"):])
+        else:
+            logger.info("[minecraft-afk] %s", line)
+
+
+async def _handle_minecraft_chat_message(payload_json: str) -> None:
+    """Пересылает сообщение игрового чата Minecraft на Telegram/XMPP/Discord."""
+    import json as _json
+
+    try:
+        data = _json.loads(payload_json)
+    except Exception:
+        logger.warning("Не удалось разобрать сообщение чата Minecraft: %s", payload_json)
+        return
+
+    username = str(data.get("username") or "Minecraft")
+    message = str(data.get("message") or "").strip()
+    if not message:
+        return
+
+    author = _colored_author(f"minecraft:{username}", username)
+    text_tg = f"{_html_escape(author, quote=False)}: {_html_escape(message, quote=False)}"
+    text_other = f"{author}: {message}"
+
+    if telegram_app and TELEGRAM_CHAT_ID:
+        try:
+            await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text_tg, parse_mode="HTML")
+        except Exception:
+            logger.exception("Не удалось переслать сообщение Minecraft-чата в Telegram")
+    if xmpp_bridge:
+        try:
+            await xmpp_bridge.send_text(text_other)
+        except Exception:
+            logger.exception("Не удалось переслать сообщение Minecraft-чата в XMPP")
+    if discord_bridge:
+        try:
+            await discord_bridge.send_text(text_other)
+        except Exception:
+            logger.exception("Не удалось переслать сообщение Minecraft-чата в Discord")
+
+
+async def _send_to_minecraft_chat(text: str) -> None:
+    """Отправляет строку в игровой чат Minecraft через AFK-бота (если он запущен)."""
+    import json as _json
+
+    if not MC_CHAT_BRIDGE_ENABLED or _minecraft_afk_process is None:
+        return
+    if _minecraft_afk_process.stdin is None:
+        return
+    try:
+        line = f"MCCHAT_OUT:{_json.dumps({'text': text[:250]})}\n"
+        _minecraft_afk_process.stdin.write(line.encode())
+        await _minecraft_afk_process.stdin.drain()
+    except Exception:
+        logger.exception("Не удалось отправить сообщение в Minecraft-чат")
 
 
 async def _stop_minecraft_afk_bot():
