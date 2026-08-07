@@ -1236,8 +1236,6 @@ class DiscordBridge(_DiscordBase):
     async def on_message(self, message: "discord.Message"):
         if self.user and message.author.id == self.user.id:
             return
-        if message.author.bot:
-            return
         if message.channel.id != DISCORD_CHANNEL_ID:
             return
 
@@ -1371,8 +1369,6 @@ class DiscordBridge(_DiscordBase):
 
     async def on_message_edit(self, before, after):
         if self.user and after.author.id == self.user.id:
-            return
-        if after.author.bot:
             return
         if after.channel.id != DISCORD_CHANNEL_ID:
             return
@@ -1661,7 +1657,9 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     msg = update.effective_message
     if msg is None:
         return
-    if msg.from_user and msg.from_user.is_bot:
+    # Игнорируем только СВОЁ ЖЕ эхо (не любых ботов вообще — иначе
+    # ломается пересылка от сторонних ботов-мостов вроде matrixt2bot).
+    if msg.from_user and msg.from_user.id == context.bot.id:
         return
 
     raw_author_name = msg.from_user.first_name if msg.from_user else "Telegram"
@@ -1848,7 +1846,7 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
     msg = update.effective_message
     if msg is None or not msg.text:
         return
-    if msg.from_user and msg.from_user.is_bot:
+    if msg.from_user and msg.from_user.id == context.bot.id:
         return
 
     _prune_bridge_records()
