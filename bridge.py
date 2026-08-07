@@ -1537,6 +1537,16 @@ async def _minecraft_power_action(signal: str) -> tuple:
         "Authorization": f"Bearer {MINECRAFT_API_KEY}",
         "Accept": "Application/vnd.pterodactyl.v1+json",
         "Content-Type": "application/json",
+        # Некоторые панели стоят за CDN/WAF (замечено на Rustix.me —
+        # cdn.mitelis.net), который блокирует запросы без "браузерных"
+        # заголовков — aiohttp по умолчанию шлёт User-Agent вида
+        # "Python/3.x aiohttp/x.x", что легко детектится как бот.
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Origin": MINECRAFT_PANEL_URL,
+        "Referer": f"{MINECRAFT_PANEL_URL}/server/{MINECRAFT_SERVER_ID}/console",
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -1544,7 +1554,8 @@ async def _minecraft_power_action(signal: str) -> tuple:
                 if resp.status in (200, 204):
                     return True, "команда отправлена"
                 body = await resp.text()
-                return False, f"HTTP {resp.status}: {body[:300]}"
+                clean_body = re.sub(r"<[^>]+>", "", body).strip()
+                return False, f"HTTP {resp.status}: {clean_body[:300]}"
     except Exception as e:
         logger.exception("Ошибка запроса к панели Minecraft (Rustix/Pterodactyl)")
         return False, str(e)
