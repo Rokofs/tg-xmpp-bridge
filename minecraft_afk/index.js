@@ -85,21 +85,31 @@ function scheduleReconnect(delayMs) {
 
 function startAntiAfk() {
   stopAntiAfk();
+  let stepDirection = 'forward';
   antiAfkTimer = setInterval(() => {
     if (!bot || !bot.entity) return;
     try {
-      // Небольшой прыжок + случайный поворот взгляда — этого обычно
-      // достаточно, чтобы сервер не считал игрока полностью неактивным.
+      // Реальное перемещение туда-обратно — судя по всему, у Aternos
+      // свой детектор AFK, который смотрит именно на изменение позиции,
+      // а не просто на входящие пакеты. Прыжки/повороты камеры одни
+      // это не обманывали (сервер всё равно кикал за "idle too long").
+      const dir = stepDirection === 'forward' ? 'forward' : 'back';
+      bot.setControlState(dir, true);
       bot.setControlState('jump', true);
-      setTimeout(() => bot && bot.setControlState('jump', false), 300);
+      setTimeout(() => {
+        if (!bot) return;
+        bot.setControlState(dir, false);
+        bot.setControlState('jump', false);
+      }, 600);
+      stepDirection = stepDirection === 'forward' ? 'back' : 'forward';
 
       const yaw = Math.random() * Math.PI * 2 - Math.PI;
-      const pitch = (Math.random() * 0.6 - 0.3);
+      const pitch = Math.random() * 0.6 - 0.3;
       bot.look(yaw, pitch, true);
     } catch (e) {
       log('Ошибка anti-AFK действия:', e.message);
     }
-  }, 25000); // каждые ~25 секунд
+  }, 12000); // каждые ~12 секунд — чаще, чем раньше (было 25 сек)
 }
 
 function stopAntiAfk() {
