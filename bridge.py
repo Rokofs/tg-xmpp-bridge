@@ -372,7 +372,13 @@ async def _propagate_deletion(record: dict, skip: str) -> None:
 
     if skip != "xmpp" and xmpp_bridge and record.get("xmpp"):
         try:
-            await xmpp_bridge.send_retraction(record["xmpp"])
+            # У retraction (XEP-0424) ненадёжная поддержка в клиентах —
+            # judging by jabagram (похожий проект), решили не полагаться на
+            # неё одну и просто "редактируем" сообщение в заглушку через
+            # тот же механизм правок (retract+resend внутри send_correction).
+            new_xmpp_id = await xmpp_bridge.send_correction("🗑 [сообщение удалено]", record["xmpp"])
+            if new_xmpp_id:
+                record["xmpp"] = new_xmpp_id
         except Exception:
             logger.exception("Не удалось отправить удаление в XMPP")
 
@@ -463,24 +469,47 @@ def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
     return None
 
 
+_MOBILE_QUOTE_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*\(GMT[+-]?\d*\)$")
+
+
 def _parse_manual_quote(body: str):
-    """Пытается распознать цитату вида '> ...\\n> ...\\n\\nостальной текст'.
+    """Разбирает тело сообщения на "цитируемую" часть (строки, начинающиеся
+    с "> ") и обычный текст — сканирует ВСЕ строки сообщения, а не только
+    идущие подряд с самого начала (цитата может быть не первой). Не
+    считает цитатой вложенные "> >" (чужая цитата внутри цитаты). Также
+    учитывает особенность некоторых мобильных XMPP-клиентов, которые
+    перед самой цитатой вставляют отдельную служебную строку вида
+    "2024-01-01  12:00 (GMT+0000)" — такую строку (и предшествующую ей
+    строку с именем отправителя) не считаем частью реальной цитаты.
 
     Возвращает (quoted_text, remaining_text). Если цитаты нет —
     (None, body).
+
+    Подход подсмотрен в похожем проекте jabagram (ventureoo/jabagram,
+    GPL-3.0) и переписан под наш стиль.
     """
-    lines = body.split("\n")
-    quoted_lines = []
-    i = 0
-    while i < len(lines) and lines[i].startswith(">"):
-        quoted_lines.append(lines[i].lstrip(">").strip())
-        i += 1
+    quoted_lines: list = []
+    other_lines: list = []
+
+    for line in body.split("\n"):
+        if line[:1] == ">" and line[1:2] == " " and line[2:3] != ">":
+            content = line[2:].strip()
+            if _MOBILE_QUOTE_TIMESTAMP_RE.match(content):
+                # служебная строка с датой/временем от мобильного клиента —
+                # значит, и предыдущая добавленная строка (имя автора)
+                # тоже была служебной, а не текстом цитаты
+                if quoted_lines:
+                    quoted_lines.pop()
+            else:
+                quoted_lines.append(content)
+        else:
+            other_lines.append(line)
+
     if not quoted_lines:
         return None, body
-    if i < len(lines) and lines[i].strip() == "":
-        i += 1
-    remaining = "\n".join(lines[i:]).strip()
+
     quoted_text = " ".join(line for line in quoted_lines if line).strip()
+    remaining = "\n".join(other_lines).strip()
     return quoted_text, remaining
 
 
