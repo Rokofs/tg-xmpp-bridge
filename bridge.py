@@ -332,6 +332,24 @@ def _prune_bridge_records() -> None:
             _discord_lookup.pop(record["discord"], None)
 
 
+def _forget_record_by_key(key: Optional[str]) -> None:
+    """Полностью убирает связку из памяти — вызывается после того, как
+    удаление сообщения уже разослано на все площадки, чтобы то же самое
+    "мёртвое" сообщение не находилось заново на следующих проверках
+    (иначе бот будет бесконечно пересоздавать заглушку "удалено")."""
+    if not key:
+        return
+    record = _bridge_records.pop(key, None)
+    if not record:
+        return
+    if record.get("tg") is not None:
+        _tg_lookup.pop(record["tg"], None)
+    if record.get("xmpp") is not None:
+        _xmpp_lookup.pop(record["xmpp"], None)
+    if record.get("discord") is not None:
+        _discord_lookup.pop(record["discord"], None)
+
+
 async def _mirror_reactions(key: str, emojis: set, skip: str) -> None:
     """Проставляет набор реакций emojis на всех площадках, кроме skip."""
     record = _bridge_records.get(key)
@@ -1234,6 +1252,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if not record:
             return
         await _propagate_deletion(record, skip="xmpp")
+        _forget_record_by_key(key)
 
     async def _manual_upload_with_browser_headers(self, filepath: Path) -> str:
         """Запасной путь загрузки: сами запрашиваем слот (id) через
@@ -1516,6 +1535,7 @@ class DiscordBridge(_DiscordBase):
         if not record:
             return
         await _propagate_deletion(record, skip="discord")
+        _forget_record_by_key(key)
 
     async def on_message_edit(self, before, after):
         if self.user and after.author.id == self.user.id:
@@ -2277,6 +2297,7 @@ async def _tg_check_deletions_loop() -> None:
                         "Обнаружено удаление сообщения Telegram %s — удаляю на других площадках", tg_id
                     )
                     await _propagate_deletion(record, skip="tg")
+                    _forget_record_by_key(key)
                 # остальные BadRequest (например "message is not modified")
                 # означают, что сообщение живо — просто игнорируем.
             except Exception:
