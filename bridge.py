@@ -361,6 +361,28 @@ async def _mirror_reactions(key: str, emojis: set, skip: str) -> None:
             logger.exception("Не удалось переслать реакцию в Telegram")
 
 
+async def _propagate_deletion(record: dict, skip: str) -> None:
+    """Удаляет сообщение на всех площадках, кроме skip (той, где его
+    удалили изначально)."""
+    if skip != "tg" and telegram_app and record.get("tg"):
+        try:
+            await telegram_app.bot.delete_message(chat_id=TELEGRAM_CHAT_ID, message_id=record["tg"])
+        except Exception:
+            logger.exception("Не удалось удалить сообщение в Telegram")
+
+    if skip != "xmpp" and xmpp_bridge and record.get("xmpp"):
+        try:
+            await xmpp_bridge.send_retraction(record["xmpp"])
+        except Exception:
+            logger.exception("Не удалось отправить удаление в XMPP")
+
+    if skip != "discord" and discord_bridge and record.get("discord"):
+        try:
+            await discord_bridge.delete_message(record["discord"])
+        except Exception:
+            logger.exception("Не удалось удалить сообщение в Discord")
+
+
 def _get_reply_targets(origin: str, replied_native_id) -> dict:
     """По id сообщения, на которое отвечают (на площадке origin),
     возвращает id этого же сообщения на двух других площадках —
@@ -795,6 +817,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         self.add_event_handler("session_start", self.on_session_start)
         self.add_event_handler("message", self.on_xmpp_message)
         self.add_event_handler("reactions", self.on_xmpp_reactions)
+        self.add_event_handler("message_retract", self.on_xmpp_retraction)
 
         # client_id -> asyncio.Future, которое разрешается, когда сервер
         # комнаты отражает наше же сообщение обратно с настоящим
@@ -812,6 +835,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         self.register_plugin("xep_0444")  # Message Reactions
         self.register_plugin("xep_0461")  # Message Replies — настоящие ответы на сообщения
         self.register_plugin("xep_0359")  # Unique and Stable Stanza IDs — нужен для reply/реакций в MUC
+        self.register_plugin("xep_0424")  # Message Retraction — удаление сообщений
 
     async def on_session_start(self, event):
         self.send_presence()
@@ -1144,6 +1168,29 @@ class XMPPBridge(slixmpp.ClientXMPP):
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
         await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
 
+    async def send_retraction(self, target_stanza_id: str) -> None:
+        """Отправляет удаление (retraction, XEP-0424) ранее отправленного
+        сообщения. send_retraction в slixmpp синхронный (сам вызывает send())."""
+        mtype = "groupchat" if XMPP_IS_MUC else "chat"
+        self["xep_0424"].send_retraction(JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype)
+
+    async def on_xmpp_retraction(self, msg):
+        """Входящее удаление сообщения от собеседника — пробрасываем на
+        другие площадки."""
+        if not self._is_from_peer(msg):
+            return
+        retract_id = msg["retract"]["id"] or None
+        if not retract_id:
+            return
+        _prune_bridge_records()
+        key = _xmpp_lookup.get(retract_id)
+        if not key:
+            return
+        record = _bridge_records.get(key)
+        if not record:
+            return
+        await _propagate_deletion(record, skip="xmpp")
+
     async def send_file(
         self, filepath: Path, caption: str = "", reply_to: Optional[str] = None,
         reply_to_jid: Optional[str] = None,
@@ -1367,6 +1414,18 @@ class DiscordBridge(_DiscordBase):
         if MC_CHAT_BRIDGE_ENABLED:
             await _send_to_minecraft_chat(f"{message.author.display_name}: {message.content}")
 
+    async def on_message_delete(self, message: "discord.Message"):
+        if message.channel.id != DISCORD_CHANNEL_ID:
+            return
+        _prune_bridge_records()
+        key = _discord_lookup.get(message.id)
+        if not key:
+            return
+        record = _bridge_records.get(key)
+        if not record:
+            return
+        await _propagate_deletion(record, skip="discord")
+
     async def on_message_edit(self, before, after):
         if self.user and after.author.id == self.user.id:
             return
@@ -1454,6 +1513,15 @@ class DiscordBridge(_DiscordBase):
             await message.edit(content=new_text)
         except Exception:
             logger.exception("Не удалось применить исправление в Discord")
+
+    async def delete_message(self, discord_message_id: int) -> None:
+        if self.bridge_channel is None:
+            return
+        try:
+            message = await self.bridge_channel.fetch_message(discord_message_id)
+            await message.delete()
+        except Exception:
+            logger.exception("Не удалось удалить сообщение в Discord")
 
     async def send_file(self, filepath: Path, caption: str = "", reply_to: Optional[int] = None) -> int:
         if self.bridge_channel is None:
@@ -2068,6 +2136,55 @@ async def _watch_minecraft_afk_process() -> None:
     await _start_minecraft_afk_bot()
 
 
+# ============================================================================
+# ПРОВЕРКА УДАЛЁННЫХ СООБЩЕНИЙ TELEGRAM — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
+# Telegram Bot API НЕ присылает ботам событие "сообщение удалено" — это
+# жёсткое ограничение платформы, обойти нельзя. Единственный известный
+# обходной путь — периодически пробовать безобидную "правку" сообщения
+# (снятие несуществующей инлайн-клавиатуры): если сообщение удалено,
+# Telegram ответит ошибкой "message to edit not found"; если нет —
+# либо тихо подтвердит, либо скажет "message is not modified" (тоже
+# значит "жив"). Проверяем только сообщения, которые уже отслеживает
+# мост (не более TELEGRAM_DELETE_CHECK_BATCH штук за раз, реже одного
+# раза в TELEGRAM_DELETE_CHECK_INTERVAL секунд — чтобы не долбить API).
+#
+# Чтобы отключить — удалите/закомментируйте вызов
+# asyncio.create_task(_tg_check_deletions_loop()) в main().
+
+TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "180"))
+TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "200"))
+
+
+async def _tg_check_deletions_loop() -> None:
+    while True:
+        await asyncio.sleep(TELEGRAM_DELETE_CHECK_INTERVAL)
+        if not telegram_app or not TELEGRAM_CHAT_ID:
+            continue
+        _prune_bridge_records()
+        items = [(k, v) for k, v in _bridge_records.items() if v.get("tg")]
+        items = items[-TELEGRAM_DELETE_CHECK_BATCH:]
+        for key, record in items:
+            tg_id = record.get("tg")
+            if not tg_id:
+                continue
+            try:
+                # Безобидно: снимаем клавиатуру, которой и так нет.
+                await telegram_app.bot.edit_message_reply_markup(
+                    chat_id=TELEGRAM_CHAT_ID, message_id=tg_id, reply_markup=None
+                )
+            except BadRequest as e:
+                if "message to edit not found" in str(e).lower():
+                    logger.info(
+                        "Обнаружено удаление сообщения Telegram %s — удаляю на других площадках", tg_id
+                    )
+                    await _propagate_deletion(record, skip="tg")
+                # остальные BadRequest (например "message is not modified")
+                # означают, что сообщение живо — просто игнорируем.
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)  # не долбим API слишком часто подряд
+
+
 async def _stop_minecraft_afk_bot():
     global _minecraft_afk_shutting_down
     _minecraft_afk_shutting_down = True
@@ -2145,6 +2262,10 @@ async def main() -> None:
             else:
                 discord_bridge = DiscordBridge()
                 asyncio.create_task(discord_bridge.start(DISCORD_BOT_TOKEN))
+
+        # Проверка удалений Telegram — необязательный блок, см. комментарий
+        # у _tg_check_deletions_loop(). Уберите строку ниже, чтобы отключить.
+        asyncio.create_task(_tg_check_deletions_loop())
     else:
         missing = []
         if not TELEGRAM_CHAT_ID:
