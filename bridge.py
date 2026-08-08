@@ -1159,11 +1159,26 @@ class XMPPBridge(slixmpp.ClientXMPP):
             stanza["reply"]["to"] = reply_to_jid or XMPP_PEER_JID
         return await self._send_and_confirm(stanza)
 
-    async def send_correction(self, new_text: str, original_stanza_id: str) -> None:
+    async def send_correction(self, new_text: str, original_stanza_id: str) -> Optional[str]:
+        """Отправляет исправление. Многие клиенты (похоже, включая Monocles
+        Chat) не понимают XEP-0308 и по спецификации обязаны показать
+        стензу с <replace> просто как обычное новое сообщение — отсюда
+        видимые "дубликаты". Раз retraction (XEP-0424) у нас уже точно
+        работает и что-то показывает — сначала удаляем старое сообщение,
+        затем шлём новое с текстом (оно всё равно содержит <replace> —
+        клиенты, которые его понимают, всё равно отредактируют на месте,
+        не заметив предшествующий retract). Возвращает id новой стензы —
+        вызывающий код должен обновить им связку, т.к. старый id теперь
+        "мёртв" (сообщение удалено)."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
+        try:
+            self["xep_0424"].send_retraction(JID(XMPP_PEER_JID), original_stanza_id, mtype=mtype)
+        except Exception:
+            logger.exception("Не удалось отправить retraction перед правкой в XMPP")
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=new_text, mtype=mtype)
         stanza["replace"]["id"] = original_stanza_id
         stanza.send()
+        return stanza["id"]
 
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
         await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
@@ -1191,6 +1206,54 @@ class XMPPBridge(slixmpp.ClientXMPP):
             return
         await _propagate_deletion(record, skip="xmpp")
 
+    async def _manual_upload_with_browser_headers(self, filepath: Path) -> str:
+        """Запасной путь загрузки: сами запрашиваем слот (id) через
+        XEP-0363, но PUT делаем своим aiohttp-запросом с "браузерными"
+        заголовками — на случай, если сервер блокирует автоматические
+        запросы без них (замечено на xmpp.jp для видео/gif)."""
+        import aiohttp
+        import mimetypes
+
+        size = filepath.stat().st_size
+        content_type = mimetypes.guess_type(str(filepath))[0] or "application/octet-stream"
+        basename = filepath.name
+
+        upload_plugin = self["xep_0363"]
+        domain = getattr(upload_plugin, "upload_service", None)
+        if not domain:
+            found = await upload_plugin.find_upload_service()
+            domain = found["from"] if found is not None else None
+        if not domain:
+            raise RuntimeError("не удалось определить сервис HTTP Upload")
+
+        slot_iq = await upload_plugin.request_slot(domain, basename, size, content_type)
+        slot = slot_iq["http_upload_slot"]
+        put_url = slot["put"]["url"]
+        get_url = slot["get"]["url"]
+
+        headers = {}
+        try:
+            for h in slot["put"]["headers"]:
+                headers[h["name"]] = h["value"]
+        except Exception:
+            pass  # не у всех серверов есть доп. заголовки в слоте — не критично
+        headers.setdefault("Content-Type", content_type)
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+
+        with open(filepath, "rb") as f:
+            data = f.read()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.put(put_url, data=data, headers=headers) as resp:
+                if resp.status not in (200, 201, 204):
+                    body = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
+
+        return get_url
+
     async def send_file(
         self, filepath: Path, caption: str = "", reply_to: Optional[str] = None,
         reply_to_jid: Optional[str] = None,
@@ -1209,21 +1272,20 @@ class XMPPBridge(slixmpp.ClientXMPP):
             logger.warning("Файл слишком большой для загрузки: %s", e)
             return await self.send_text(f"{caption} (файл слишком большой для XMPP-сервера)".strip())
         except HTTPError as e:
-            # Некоторые серверы (замечено на xmpp.jp) отклоняют PUT для
-            # определённых расширений (например, видео/gif) с 405.
-            # Пробуем обойти: перезаливаем тот же файл под нейтральным
-            # расширением .dat.
-            logger.warning("Сервер отклонил загрузку (%s), пробую с нейтральным расширением", e)
-            renamed = filepath.with_name(filepath.stem + "_upload.dat")
+            # Некоторые серверы (замечено на xmpp.jp) отклоняют
+            # автоматическую загрузку некоторых типов файлов (видео/gif)
+            # с 405 — но при этом те же файлы нормально загружаются через
+            # обычный XMPP-клиент вручную. Похоже, дело не в самом файле,
+            # а в том, что PUT-запрос от slixmpp не похож на "настоящий"
+            # браузерный запрос (нет привычных заголовков вроде
+            # User-Agent). Пробуем залить вручную с такими заголовками.
+            logger.warning("Сервер отклонил загрузку (%s), пробую вручную с браузерными заголовками", e)
             try:
-                shutil.copyfile(filepath, renamed)
-                url = await self["xep_0363"].upload_file(str(renamed))
-                logger.info("Обходной путь сработал — файл загружен под нейтральным расширением")
+                url = await self._manual_upload_with_browser_headers(filepath)
+                logger.info("Обходной путь сработал — файл загружен вручную с браузерными заголовками")
             except Exception:
                 logger.exception("Обходной путь тоже не сработал — сервер отклоняет файл")
                 return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
-            finally:
-                renamed.unlink(missing_ok=True)
         except IqError as e:
             logger.exception("Ошибка загрузки файла на XMPP-сервер")
             return await self.send_text(f"{caption} (ошибка загрузки файла: {e})".strip())
@@ -1447,7 +1509,9 @@ class DiscordBridge(_DiscordBase):
 
         if xmpp_bridge and record.get("xmpp"):
             try:
-                await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
+                new_xmpp_id = await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
+                if new_xmpp_id:
+                    _link_record(key, xmpp=new_xmpp_id)
             except Exception:
                 logger.exception("Не удалось переслать исправление в XMPP")
         if telegram_app and record.get("tg"):
@@ -1935,7 +1999,9 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
     if xmpp_bridge and record.get("xmpp"):
         try:
             xmpp_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'xmpp')} (ред.)"
-            await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
+            new_xmpp_id = await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
+            if new_xmpp_id:
+                _link_record(key, xmpp=new_xmpp_id)
         except Exception:
             logger.exception("Не удалось переслать исправление в XMPP")
     if discord_bridge and record.get("discord"):
