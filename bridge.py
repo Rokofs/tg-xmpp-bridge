@@ -1846,6 +1846,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     msg = update.effective_message
     if msg is None:
         return
+    # Технические пересылки-проверки (см. _tg_check_deletions_loop) — не
+    # настоящие сообщения, пересылать их дальше не нужно.
+    if msg.message_id in _verification_forward_ids:
+        return
     # Игнорируем только СВОЁ ЖЕ эхо (не любых ботов вообще — иначе
     # ломается пересылка от сторонних ботов-мостов вроде matrixt2bot).
     if msg.from_user and msg.from_user.id == context.bot.id:
@@ -2275,6 +2279,14 @@ async def _watch_minecraft_afk_process() -> None:
 # asyncio.create_task(_tg_check_deletions_loop()) в main().
 
 TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "10"))
+# id технических пересылок-проверок (см. "message can't be edited" ниже) —
+# чтобы обычный обработчик сообщений не переслал их дальше как настоящие.
+_verification_forward_ids: set = set()
+
+
+async def _forget_verification_id_later(message_id: int, delay: float = 30.0) -> None:
+    await asyncio.sleep(delay)
+    _verification_forward_ids.discard(message_id)
 TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "200"))
 # Пауза между отдельными проверками внутри одного прохода — весь проход
 # (до 200 сообщений) должен укладываться в несколько секунд, чтобы не
@@ -2312,6 +2324,7 @@ async def _tg_check_deletions_loop() -> None:
                     "message to edit not found",
                     "message_id_invalid",
                     "message to delete not found",
+                    "message to forward not found",
                     "message can't be found",
                 )
                 if any(marker in error_text for marker in deleted_markers):
@@ -2320,6 +2333,49 @@ async def _tg_check_deletions_loop() -> None:
                     )
                     await _propagate_deletion(record, skip="tg")
                     _forget_record_by_key(key)
+                elif "message can't be edited" in error_text:
+                    # editMessageReplyMarkup в принципе не работает для этого
+                    # сообщения (не про удаление — какое-то другое
+                    # ограничение). Проверяем иначе: пересылаем сообщение
+                    # самому себе и сразу удаляем копию. Если оригинала уже
+                    # нет — сама пересылка вернёт ошибку "не найдено".
+                    try:
+                        forwarded = await telegram_app.bot.forward_message(
+                            chat_id=TELEGRAM_CHAT_ID, from_chat_id=TELEGRAM_CHAT_ID, message_id=tg_id
+                        )
+                        _verification_forward_ids.add(forwarded.message_id)
+                        try:
+                            await telegram_app.bot.delete_message(
+                                chat_id=TELEGRAM_CHAT_ID, message_id=forwarded.message_id
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Не удалось удалить временную копию (id %s) после проверки пересылкой",
+                                forwarded.message_id,
+                            )
+                        # Не убираем id из множества сразу — Telegram доставляет
+                        # обновления через long polling не мгновенно, апдейт про
+                        # эту пересылку может прийти чуть позже. Уберём с запасом.
+                        asyncio.create_task(_forget_verification_id_later(forwarded.message_id))
+                    except BadRequest as fe:
+                        forward_error = str(fe).lower()
+                        if any(marker in forward_error for marker in deleted_markers):
+                            logger.info(
+                                "Обнаружено удаление сообщения Telegram %s (через пересылку) — "
+                                "удаляю на других площадках", tg_id,
+                            )
+                            await _propagate_deletion(record, skip="tg")
+                            _forget_record_by_key(key)
+                        else:
+                            logger.info(
+                                "Проверка удаления Telegram %s через пересылку: неопознанный BadRequest: %s",
+                                tg_id, fe,
+                            )
+                    except Exception as fe:
+                        logger.info(
+                            "Проверка удаления Telegram %s через пересылку: прочая ошибка %s: %s",
+                            tg_id, type(fe).__name__, fe,
+                        )
                 elif "message is not modified" not in error_text:
                     # Неизвестный вариант ошибки — не тот, что мы уже знаем
                     # как "сообщение живо", и не как "сообщение удалено".
