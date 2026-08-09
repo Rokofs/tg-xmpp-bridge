@@ -2283,6 +2283,10 @@ TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY"
 
 
 async def _tg_check_deletions_loop() -> None:
+    logger.info(
+        "Проверка удалений Telegram запущена (каждые %s сек, до %s сообщений за проход)",
+        TELEGRAM_DELETE_CHECK_INTERVAL, TELEGRAM_DELETE_CHECK_BATCH,
+    )
     while True:
         await asyncio.sleep(TELEGRAM_DELETE_CHECK_INTERVAL)
         if not telegram_app or not TELEGRAM_CHAT_ID:
@@ -2300,16 +2304,31 @@ async def _tg_check_deletions_loop() -> None:
                     chat_id=TELEGRAM_CHAT_ID, message_id=tg_id, reply_markup=None
                 )
             except BadRequest as e:
-                if "message to edit not found" in str(e).lower():
+                error_text = str(e).lower()
+                # Telegram может вернуть разные формулировки для удалённого
+                # сообщения в зависимости от ситуации — проверяем известные
+                # варианты, а не только один текст.
+                deleted_markers = (
+                    "message to edit not found",
+                    "message_id_invalid",
+                    "message to delete not found",
+                    "message can't be found",
+                )
+                if any(marker in error_text for marker in deleted_markers):
                     logger.info(
                         "Обнаружено удаление сообщения Telegram %s — удаляю на других площадках", tg_id
                     )
                     await _propagate_deletion(record, skip="tg")
                     _forget_record_by_key(key)
-                # остальные BadRequest (например "message is not modified")
-                # означают, что сообщение живо — просто игнорируем.
-            except Exception:
-                pass
+                elif "message is not modified" not in error_text:
+                    # Неизвестный вариант ошибки — не тот, что мы уже знаем
+                    # как "сообщение живо", и не как "сообщение удалено".
+                    # Логируем, чтобы в следующий раз не гадать вслепую.
+                    logger.info(
+                        "Проверка удаления Telegram %s: неопознанный BadRequest: %s", tg_id, e
+                    )
+            except Exception as e:
+                logger.info("Проверка удаления Telegram %s: прочая ошибка %s: %s", tg_id, type(e).__name__, e)
             await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
 
 
