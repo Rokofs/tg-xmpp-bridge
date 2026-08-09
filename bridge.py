@@ -390,13 +390,11 @@ async def _propagate_deletion(record: dict, skip: str) -> None:
 
     if skip != "xmpp" and xmpp_bridge and record.get("xmpp"):
         try:
-            # У retraction (XEP-0424) ненадёжная поддержка в клиентах —
-            # judging by jabagram (похожий проект), решили не полагаться на
-            # неё одну и просто "редактируем" сообщение в заглушку через
-            # тот же механизм правок (retract+resend внутри send_correction).
-            new_xmpp_id = await xmpp_bridge.send_correction("🗑 [сообщение удалено]", record["xmpp"])
-            if new_xmpp_id:
-                record["xmpp"] = new_xmpp_id
+            # Чистый retraction (XEP-0424) без текстовой заглушки — клиенты
+            # с поддержкой удалят сообщение молча. Раньше здесь была правка
+            # на текст "[сообщение удалено]", но она оставляла в чате
+            # видимый мусор вместо реального исчезновения сообщения.
+            await xmpp_bridge.send_retraction(record["xmpp"])
         except Exception:
             logger.exception("Не удалось отправить удаление в XMPP")
 
@@ -1219,7 +1217,13 @@ class XMPPBridge(slixmpp.ClientXMPP):
         "мёртв" (сообщение удалено)."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         try:
-            self["xep_0424"].send_retraction(JID(XMPP_PEER_JID), original_stanza_id, mtype=mtype)
+            # include_fallback=False — иначе slixmpp добавляет в стензу
+            # текстовый "fallback body" ("This message has been retracted
+            # by the sender"), который клиенты показывают отдельной
+            # надписью. Нам это не нужно — удаление должно быть тихим.
+            self["xep_0424"].send_retraction(
+                JID(XMPP_PEER_JID), original_stanza_id, mtype=mtype, include_fallback=False
+            )
         except Exception:
             logger.exception("Не удалось отправить retraction перед правкой в XMPP")
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=new_text, mtype=mtype)
@@ -1232,9 +1236,13 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
     async def send_retraction(self, target_stanza_id: str) -> None:
         """Отправляет удаление (retraction, XEP-0424) ранее отправленного
-        сообщения. send_retraction в slixmpp синхронный (сам вызывает send())."""
+        сообщения — тихо, без текстовой надписи-заглушки для клиентов,
+        не понимающих retraction (include_fallback=False).
+        send_retraction в slixmpp синхронный (сам вызывает send())."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
-        self["xep_0424"].send_retraction(JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype)
+        self["xep_0424"].send_retraction(
+            JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype, include_fallback=False
+        )
 
     async def on_xmpp_retraction(self, msg):
         """Входящее удаление сообщения от собеседника — пробрасываем на
