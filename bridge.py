@@ -980,6 +980,16 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if not self._is_from_peer(msg):
             return
 
+        # Стензы retraction (XEP-0424) часто несут текстовый <body> как
+        # fallback для клиентов без поддержки удаления (например, Monocles
+        # сама подставляет "This message has been retracted by the
+        # sender."). Отдельный обработчик on_xmpp_retraction уже разбирает
+        # такие стензы для пересылки удаления — здесь их нужно
+        # проигнорировать, иначе fallback-текст улетит как обычное новое
+        # сообщение на все площадки.
+        if msg["retract"]["id"]:
+            return
+
         body = (msg["body"] or "").strip()
         oob_url = msg["oob"]["url"] or None
         correction_id = msg["replace"]["id"] or None
