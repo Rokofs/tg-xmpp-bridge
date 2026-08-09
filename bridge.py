@@ -326,32 +326,10 @@ def _prune_bridge_records() -> None:
             continue
         if record.get("tg") is not None:
             _tg_lookup.pop(record["tg"], None)
-            _non_editable_tg_messages.discard(record["tg"])
-            _last_forward_check.pop(record["tg"], None)
         if record.get("xmpp") is not None:
             _xmpp_lookup.pop(record["xmpp"], None)
         if record.get("discord") is not None:
             _discord_lookup.pop(record["discord"], None)
-
-
-def _forget_record_by_key(key: Optional[str]) -> None:
-    """Полностью убирает связку из памяти — вызывается после того, как
-    удаление сообщения уже разослано на все площадки, чтобы то же самое
-    "мёртвое" сообщение не находилось заново на следующих проверках
-    (иначе бот будет бесконечно пересоздавать заглушку "удалено")."""
-    if not key:
-        return
-    record = _bridge_records.pop(key, None)
-    if not record:
-        return
-    if record.get("tg") is not None:
-        _tg_lookup.pop(record["tg"], None)
-        _non_editable_tg_messages.discard(record["tg"])
-        _last_forward_check.pop(record["tg"], None)
-    if record.get("xmpp") is not None:
-        _xmpp_lookup.pop(record["xmpp"], None)
-    if record.get("discord") is not None:
-        _discord_lookup.pop(record["discord"], None)
 
 
 async def _mirror_reactions(key: str, emojis: set, skip: str) -> None:
@@ -394,10 +372,6 @@ async def _propagate_deletion(record: dict, skip: str) -> None:
 
     if skip != "xmpp" and xmpp_bridge and record.get("xmpp"):
         try:
-            # Чистый retraction (XEP-0424) без текстовой заглушки — клиенты
-            # с поддержкой удалят сообщение молча. Раньше здесь была правка
-            # на текст "[сообщение удалено]", но она оставляла в чате
-            # видимый мусор вместо реального исчезновения сообщения.
             await xmpp_bridge.send_retraction(record["xmpp"])
         except Exception:
             logger.exception("Не удалось отправить удаление в XMPP")
@@ -489,47 +463,24 @@ def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
     return None
 
 
-_MOBILE_QUOTE_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*\(GMT[+-]?\d*\)$")
-
-
 def _parse_manual_quote(body: str):
-    """Разбирает тело сообщения на "цитируемую" часть (строки, начинающиеся
-    с "> ") и обычный текст — сканирует ВСЕ строки сообщения, а не только
-    идущие подряд с самого начала (цитата может быть не первой). Не
-    считает цитатой вложенные "> >" (чужая цитата внутри цитаты). Также
-    учитывает особенность некоторых мобильных XMPP-клиентов, которые
-    перед самой цитатой вставляют отдельную служебную строку вида
-    "2024-01-01  12:00 (GMT+0000)" — такую строку (и предшествующую ей
-    строку с именем отправителя) не считаем частью реальной цитаты.
+    """Пытается распознать цитату вида '> ...\\n> ...\\n\\nостальной текст'.
 
     Возвращает (quoted_text, remaining_text). Если цитаты нет —
     (None, body).
-
-    Подход подсмотрен в похожем проекте jabagram (ventureoo/jabagram,
-    GPL-3.0) и переписан под наш стиль.
     """
-    quoted_lines: list = []
-    other_lines: list = []
-
-    for line in body.split("\n"):
-        if line[:1] == ">" and line[1:2] == " " and line[2:3] != ">":
-            content = line[2:].strip()
-            if _MOBILE_QUOTE_TIMESTAMP_RE.match(content):
-                # служебная строка с датой/временем от мобильного клиента —
-                # значит, и предыдущая добавленная строка (имя автора)
-                # тоже была служебной, а не текстом цитаты
-                if quoted_lines:
-                    quoted_lines.pop()
-            else:
-                quoted_lines.append(content)
-        else:
-            other_lines.append(line)
-
+    lines = body.split("\n")
+    quoted_lines = []
+    i = 0
+    while i < len(lines) and lines[i].startswith(">"):
+        quoted_lines.append(lines[i].lstrip(">").strip())
+        i += 1
     if not quoted_lines:
         return None, body
-
+    if i < len(lines) and lines[i].strip() == "":
+        i += 1
+    remaining = "\n".join(lines[i:]).strip()
     quoted_text = " ".join(line for line in quoted_lines if line).strip()
-    remaining = "\n".join(other_lines).strip()
     return quoted_text, remaining
 
 
@@ -980,16 +931,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if not self._is_from_peer(msg):
             return
 
-        # Стензы retraction (XEP-0424) часто несут текстовый <body> как
-        # fallback для клиентов без поддержки удаления (например, Monocles
-        # сама подставляет "This message has been retracted by the
-        # sender."). Отдельный обработчик on_xmpp_retraction уже разбирает
-        # такие стензы для пересылки удаления — здесь их нужно
-        # проигнорировать, иначе fallback-текст улетит как обычное новое
-        # сообщение на все площадки.
-        if msg["retract"]["id"]:
-            return
-
         body = (msg["body"] or "").strip()
         oob_url = msg["oob"]["url"] or None
         correction_id = msg["replace"]["id"] or None
@@ -1218,45 +1159,20 @@ class XMPPBridge(slixmpp.ClientXMPP):
             stanza["reply"]["to"] = reply_to_jid or XMPP_PEER_JID
         return await self._send_and_confirm(stanza)
 
-    async def send_correction(self, new_text: str, original_stanza_id: str) -> Optional[str]:
-        """Отправляет исправление. Многие клиенты (похоже, включая Monocles
-        Chat) не понимают XEP-0308 и по спецификации обязаны показать
-        стензу с <replace> просто как обычное новое сообщение — отсюда
-        видимые "дубликаты". Раз retraction (XEP-0424) у нас уже точно
-        работает и что-то показывает — сначала удаляем старое сообщение,
-        затем шлём новое с текстом (оно всё равно содержит <replace> —
-        клиенты, которые его понимают, всё равно отредактируют на месте,
-        не заметив предшествующий retract). Возвращает id новой стензы —
-        вызывающий код должен обновить им связку, т.к. старый id теперь
-        "мёртв" (сообщение удалено)."""
+    async def send_correction(self, new_text: str, original_stanza_id: str) -> None:
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
-        try:
-            # include_fallback=False — иначе slixmpp добавляет в стензу
-            # текстовый "fallback body" ("This message has been retracted
-            # by the sender"), который клиенты показывают отдельной
-            # надписью. Нам это не нужно — удаление должно быть тихим.
-            self["xep_0424"].send_retraction(
-                JID(XMPP_PEER_JID), original_stanza_id, mtype=mtype, include_fallback=False
-            )
-        except Exception:
-            logger.exception("Не удалось отправить retraction перед правкой в XMPP")
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=new_text, mtype=mtype)
         stanza["replace"]["id"] = original_stanza_id
         stanza.send()
-        return stanza["id"]
 
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
         await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
 
     async def send_retraction(self, target_stanza_id: str) -> None:
         """Отправляет удаление (retraction, XEP-0424) ранее отправленного
-        сообщения — тихо, без текстовой надписи-заглушки для клиентов,
-        не понимающих retraction (include_fallback=False).
-        send_retraction в slixmpp синхронный (сам вызывает send())."""
+        сообщения. send_retraction в slixmpp синхронный (сам вызывает send())."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
-        self["xep_0424"].send_retraction(
-            JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype, include_fallback=False
-        )
+        self["xep_0424"].send_retraction(JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype)
 
     async def on_xmpp_retraction(self, msg):
         """Входящее удаление сообщения от собеседника — пробрасываем на
@@ -1274,55 +1190,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if not record:
             return
         await _propagate_deletion(record, skip="xmpp")
-        _forget_record_by_key(key)
-
-    async def _manual_upload_with_browser_headers(self, filepath: Path) -> str:
-        """Запасной путь загрузки: сами запрашиваем слот (id) через
-        XEP-0363, но PUT делаем своим aiohttp-запросом с "браузерными"
-        заголовками — на случай, если сервер блокирует автоматические
-        запросы без них (замечено на xmpp.jp для видео/gif)."""
-        import aiohttp
-        import mimetypes
-
-        size = filepath.stat().st_size
-        content_type = mimetypes.guess_type(str(filepath))[0] or "application/octet-stream"
-        basename = filepath.name
-
-        upload_plugin = self["xep_0363"]
-        domain = getattr(upload_plugin, "upload_service", None)
-        if not domain:
-            found = await upload_plugin.find_upload_service()
-            domain = found["from"] if found is not None else None
-        if not domain:
-            raise RuntimeError("не удалось определить сервис HTTP Upload")
-
-        slot_iq = await upload_plugin.request_slot(domain, basename, size, content_type)
-        slot = slot_iq["http_upload_slot"]
-        put_url = slot["put"]["url"]
-        get_url = slot["get"]["url"]
-
-        headers = {}
-        try:
-            for h in slot["put"]["headers"]:
-                headers[h["name"]] = h["value"]
-        except Exception:
-            pass  # не у всех серверов есть доп. заголовки в слоте — не критично
-        headers.setdefault("Content-Type", content_type)
-        headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-
-        with open(filepath, "rb") as f:
-            data = f.read()
-
-        async with aiohttp.ClientSession() as session:
-            async with session.put(put_url, data=data, headers=headers) as resp:
-                if resp.status not in (200, 201, 204):
-                    body = await resp.text()
-                    raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
-
-        return get_url
 
     async def send_file(
         self, filepath: Path, caption: str = "", reply_to: Optional[str] = None,
@@ -1342,20 +1209,21 @@ class XMPPBridge(slixmpp.ClientXMPP):
             logger.warning("Файл слишком большой для загрузки: %s", e)
             return await self.send_text(f"{caption} (файл слишком большой для XMPP-сервера)".strip())
         except HTTPError as e:
-            # Некоторые серверы (замечено на xmpp.jp) отклоняют
-            # автоматическую загрузку некоторых типов файлов (видео/gif)
-            # с 405 — но при этом те же файлы нормально загружаются через
-            # обычный XMPP-клиент вручную. Похоже, дело не в самом файле,
-            # а в том, что PUT-запрос от slixmpp не похож на "настоящий"
-            # браузерный запрос (нет привычных заголовков вроде
-            # User-Agent). Пробуем залить вручную с такими заголовками.
-            logger.warning("Сервер отклонил загрузку (%s), пробую вручную с браузерными заголовками", e)
+            # Некоторые серверы (замечено на xmpp.jp) отклоняют PUT для
+            # определённых расширений (например, видео/gif) с 405.
+            # Пробуем обойти: перезаливаем тот же файл под нейтральным
+            # расширением .dat.
+            logger.warning("Сервер отклонил загрузку (%s), пробую с нейтральным расширением", e)
+            renamed = filepath.with_name(filepath.stem + "_upload.dat")
             try:
-                url = await self._manual_upload_with_browser_headers(filepath)
-                logger.info("Обходной путь сработал — файл загружен вручную с браузерными заголовками")
+                shutil.copyfile(filepath, renamed)
+                url = await self["xep_0363"].upload_file(str(renamed))
+                logger.info("Обходной путь сработал — файл загружен под нейтральным расширением")
             except Exception:
                 logger.exception("Обходной путь тоже не сработал — сервер отклоняет файл")
                 return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
+            finally:
+                renamed.unlink(missing_ok=True)
         except IqError as e:
             logger.exception("Ошибка загрузки файла на XMPP-сервер")
             return await self.send_text(f"{caption} (ошибка загрузки файла: {e})".strip())
@@ -1557,7 +1425,6 @@ class DiscordBridge(_DiscordBase):
         if not record:
             return
         await _propagate_deletion(record, skip="discord")
-        _forget_record_by_key(key)
 
     async def on_message_edit(self, before, after):
         if self.user and after.author.id == self.user.id:
@@ -1580,9 +1447,7 @@ class DiscordBridge(_DiscordBase):
 
         if xmpp_bridge and record.get("xmpp"):
             try:
-                new_xmpp_id = await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
-                if new_xmpp_id:
-                    _link_record(key, xmpp=new_xmpp_id)
+                await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
             except Exception:
                 logger.exception("Не удалось переслать исправление в XMPP")
         if telegram_app and record.get("tg"):
@@ -1860,10 +1725,6 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     msg = update.effective_message
     if msg is None:
         return
-    # Технические пересылки-проверки (см. _tg_check_deletions_loop) — не
-    # настоящие сообщения, пересылать их дальше не нужно.
-    if msg.message_id in _verification_forward_ids:
-        return
     # Игнорируем только СВОЁ ЖЕ эхо (не любых ботов вообще — иначе
     # ломается пересылка от сторонних ботов-мостов вроде matrixt2bot).
     if msg.from_user and msg.from_user.id == context.bot.id:
@@ -2074,9 +1935,7 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
     if xmpp_bridge and record.get("xmpp"):
         try:
             xmpp_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'xmpp')} (ред.)"
-            new_xmpp_id = await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
-            if new_xmpp_id:
-                _link_record(key, xmpp=new_xmpp_id)
+            await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
         except Exception:
             logger.exception("Не удалось переслать исправление в XMPP")
     if discord_bridge and record.get("discord"):
@@ -2292,51 +2151,11 @@ async def _watch_minecraft_afk_process() -> None:
 # Чтобы отключить — удалите/закомментируйте вызов
 # asyncio.create_task(_tg_check_deletions_loop()) в main().
 
-TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "10"))
+TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "180"))
 TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "200"))
-# Пауза между отдельными проверками внутри одного прохода — весь проход
-# (до 200 сообщений) должен укладываться в несколько секунд, чтобы не
-# съедать весь интервал между проходами.
-TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "0.03"))
-
-# id технических пересылок-проверок (см. "message can't be edited" ниже) —
-# чтобы обычный обработчик сообщений не переслал их дальше как настоящие.
-_verification_forward_ids: set = set()
-
-
-async def _forget_verification_id_later(message_id: int, delay: float = 30.0) -> None:
-    await asyncio.sleep(delay)
-    _verification_forward_ids.discard(message_id)
-
-
-# Сообщения, которые бот не может редактировать (написаны не самим ботом —
-# то есть настоящими людьми, а не переслано ботом с других площадок).
-# Для них editMessageReplyMarkup ВСЕГДА вернёт "message can't be edited" —
-# незачем каждый раз пытаться и проваливаться в запасной способ (пересылка
-# + удаление), это заметно мигает в чате. Проверяем такие сообщения
-# намного реже, отдельным более редким циклом.
-_non_editable_tg_messages: set = set()
-_last_forward_check: dict = {}  # message_id -> time.monotonic() последней проверки пересылкой
-TELEGRAM_FORWARD_CHECK_MIN_INTERVAL = float(
-    os.environ.get("TELEGRAM_FORWARD_CHECK_MIN_INTERVAL", "120")
-)
 
 
 async def _tg_check_deletions_loop() -> None:
-    logger.info(
-        "Проверка удалений Telegram запущена (каждые %s сек, до %s сообщений за проход)",
-        TELEGRAM_DELETE_CHECK_INTERVAL, TELEGRAM_DELETE_CHECK_BATCH,
-    )
-    # Telegram может вернуть разные формулировки для удалённого сообщения
-    # в зависимости от ситуации — проверяем известные варианты сразу.
-    deleted_markers = (
-        "message to edit not found",
-        "message_id_invalid",
-        "message to delete not found",
-        "message to forward not found",
-        "message can't be found",
-    )
-
     while True:
         await asyncio.sleep(TELEGRAM_DELETE_CHECK_INTERVAL)
         if not telegram_app or not TELEGRAM_CHAT_ID:
@@ -2344,86 +2163,26 @@ async def _tg_check_deletions_loop() -> None:
         _prune_bridge_records()
         items = [(k, v) for k, v in _bridge_records.items() if v.get("tg")]
         items = items[-TELEGRAM_DELETE_CHECK_BATCH:]
-
         for key, record in items:
             tg_id = record.get("tg")
             if not tg_id:
                 continue
-
-            # --- "чужие" сообщения (написаны не самим ботом) — не можем
-            # редактировать в принципе, проверяем только через пересылку,
-            # и не чаще, чем раз в TELEGRAM_FORWARD_CHECK_MIN_INTERVAL сек
-            # (иначе получается заметное мигание в чате на каждом проходе).
-            if tg_id in _non_editable_tg_messages:
-                last = _last_forward_check.get(tg_id, 0.0)
-                if time.monotonic() - last < TELEGRAM_FORWARD_CHECK_MIN_INTERVAL:
-                    continue
-                _last_forward_check[tg_id] = time.monotonic()
-
-                try:
-                    forwarded = await telegram_app.bot.forward_message(
-                        chat_id=TELEGRAM_CHAT_ID, from_chat_id=TELEGRAM_CHAT_ID, message_id=tg_id
-                    )
-                    _verification_forward_ids.add(forwarded.message_id)
-                    try:
-                        await telegram_app.bot.delete_message(
-                            chat_id=TELEGRAM_CHAT_ID, message_id=forwarded.message_id
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Не удалось удалить временную копию (id %s) после проверки пересылкой",
-                            forwarded.message_id,
-                        )
-                    asyncio.create_task(_forget_verification_id_later(forwarded.message_id))
-                except BadRequest as fe:
-                    if any(marker in str(fe).lower() for marker in deleted_markers):
-                        logger.info(
-                            "Обнаружено удаление сообщения Telegram %s (через пересылку) — "
-                            "удаляю на других площадках", tg_id,
-                        )
-                        await _propagate_deletion(record, skip="tg")
-                        _forget_record_by_key(key)
-                        _non_editable_tg_messages.discard(tg_id)
-                        _last_forward_check.pop(tg_id, None)
-                except Exception:
-                    pass
-                await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
-                continue
-
-            # --- обычная (дешёвая) проверка через editMessageReplyMarkup ---
             try:
                 # Безобидно: снимаем клавиатуру, которой и так нет.
                 await telegram_app.bot.edit_message_reply_markup(
                     chat_id=TELEGRAM_CHAT_ID, message_id=tg_id, reply_markup=None
                 )
             except BadRequest as e:
-                error_text = str(e).lower()
-                if any(marker in error_text for marker in deleted_markers):
+                if "message to edit not found" in str(e).lower():
                     logger.info(
                         "Обнаружено удаление сообщения Telegram %s — удаляю на других площадках", tg_id
                     )
                     await _propagate_deletion(record, skip="tg")
-                    _forget_record_by_key(key)
-                elif "message can't be edited" in error_text:
-                    # Сообщение написано не ботом — запоминаем и дальше
-                    # проверяем через пересылку, но редко (см. выше).
-                    # Важно: сразу проставляем "последнюю проверку" сейчас,
-                    # а не ждём следующего цикла — иначе первая пересылка-
-                    # проверка срабатывала бы уже через ~10 сек после
-                    # обнаружения, а не через полный интервал (заметное
-                    # мигание сразу после каждого нового сообщения).
-                    _non_editable_tg_messages.add(tg_id)
-                    _last_forward_check[tg_id] = time.monotonic()
-                elif "message is not modified" not in error_text:
-                    # Неизвестный вариант ошибки — не тот, что мы уже знаем
-                    # как "сообщение живо", и не как "сообщение удалено".
-                    # Логируем, чтобы в следующий раз не гадать вслепую.
-                    logger.info(
-                        "Проверка удаления Telegram %s: неопознанный BadRequest: %s", tg_id, e
-                    )
-            except Exception as e:
-                logger.info("Проверка удаления Telegram %s: прочая ошибка %s: %s", tg_id, type(e).__name__, e)
-            await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
+                # остальные BadRequest (например "message is not modified")
+                # означают, что сообщение живо — просто игнорируем.
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)  # не долбим API слишком часто подряд
 
 
 async def _stop_minecraft_afk_bot():
