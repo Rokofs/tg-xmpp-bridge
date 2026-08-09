@@ -2246,8 +2246,12 @@ async def _watch_minecraft_afk_process() -> None:
 # Чтобы отключить — удалите/закомментируйте вызов
 # asyncio.create_task(_tg_check_deletions_loop()) в main().
 
-TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "180"))
+TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "10"))
 TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "200"))
+# Пауза между отдельными проверками внутри одного прохода — весь проход
+# (до 200 сообщений) должен укладываться в несколько секунд, чтобы не
+# съедать весь интервал между проходами.
+TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "0.03"))
 
 
 async def _tg_check_deletions_loop() -> None:
@@ -2277,7 +2281,7 @@ async def _tg_check_deletions_loop() -> None:
                 # означают, что сообщение живо — просто игнорируем.
             except Exception:
                 pass
-            await asyncio.sleep(0.2)  # не долбим API слишком часто подряд
+            await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
 
 
 async def _stop_minecraft_afk_bot():
