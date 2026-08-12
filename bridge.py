@@ -539,6 +539,19 @@ def _parse_manual_quote(body: str):
     return quoted_text, remaining
 
 
+def _strip_manual_quote_for_telegram(text: str) -> str:
+    """Убирает "сырые" ручные цитаты (строки, начинающиеся с '> ') из
+    текста перед отправкой в Telegram — там уже работает настоящий
+    reply_to_message_id, а вложенный текст цитаты только захламляет
+    сообщение (особенно после нескольких "прыжков" через сторонних
+    ботов вроде matrixt2bot/ChatResender, у каждого из которых свой
+    формат цитирования текстом)."""
+    if not text:
+        return text
+    _quoted, remaining = _parse_manual_quote(text)
+    return remaining if remaining else text
+
+
 # Простое (не идеальное) распознавание "текст состоит только из эмодзи" —
 # без внешней зависимости на пакет `emoji`. Покрывает подавляющее
 # большинство современных эмодзи (включая ZWJ-последовательности и
@@ -1190,7 +1203,8 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if local_path is not None:
             base = effective_body if effective_body and effective_body != oob_url else ""
             caption_tg = (
-                f"{_html_escape(display_sender, quote=False)}: {_convert_markup(base, 'xmpp', 'telegram')}"
+                f"{_html_escape(display_sender, quote=False)}: "
+                f"{_convert_markup(_strip_manual_quote_for_telegram(base), 'xmpp', 'telegram')}"
                 if base else _html_escape(display_sender, quote=False)
             )
             caption_discord = (
@@ -1223,7 +1237,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
             text_tg = f"{_html_escape(display_sender, quote=False)}: {_html_escape(oob_url, quote=False)}"
             text_discord = f"{display_sender}: {oob_url}"
         else:
-            converted_tg = _convert_markup(effective_body, "xmpp", "telegram")
+            converted_tg = _convert_markup(_strip_manual_quote_for_telegram(effective_body), "xmpp", "telegram")
             converted_discord = _convert_markup(effective_body, "xmpp", "discord")
             if oob_url and effective_body != oob_url:
                 text_tg = (
@@ -1577,6 +1591,21 @@ class DiscordBridge(_DiscordBase):
         intents.guilds = True
         super().__init__(intents=intents)
         self.bridge_channel = None  # type: Optional["discord.abc.Messageable"]
+        # Discord-шлюз иногда повторно доставляет событие о недавнем
+        # сообщении при переподключении — без этого получались бы
+        # дубликаты (особенно заметно на медиа).
+        self._recent_message_ids: set = set()
+        self._recent_message_ids_order: list = []
+
+    def _already_processed(self, message_id: int) -> bool:
+        if message_id in self._recent_message_ids:
+            return True
+        self._recent_message_ids.add(message_id)
+        self._recent_message_ids_order.append(message_id)
+        if len(self._recent_message_ids_order) > 500:
+            old = self._recent_message_ids_order.pop(0)
+            self._recent_message_ids.discard(old)
+        return False
 
     async def on_ready(self):
         channel = self.get_channel(DISCORD_CHANNEL_ID)
@@ -1596,6 +1625,9 @@ class DiscordBridge(_DiscordBase):
         if self.user and message.author.id == self.user.id:
             return
         if message.channel.id != DISCORD_CHANNEL_ID:
+            return
+        if self._already_processed(message.id):
+            logger.info("Discord прислал повторно уже обработанное сообщение %s — игнорирую", message.id)
             return
 
         author = _colored_author(f"discord:{message.author.id}", message.author.display_name)
@@ -1652,7 +1684,7 @@ class DiscordBridge(_DiscordBase):
                 caption_xmpp = f"{author}: {_convert_markup(message.content, 'discord', 'xmpp')}"
                 caption_tg = (
                     f"{_html_escape(author, quote=False)}: "
-                    f"{_convert_markup(message.content, 'discord', 'telegram')}"
+                    f"{_convert_markup(_strip_manual_quote_for_telegram(message.content), 'discord', 'telegram')}"
                 )
             else:
                 caption_xmpp = author
@@ -1696,7 +1728,10 @@ class DiscordBridge(_DiscordBase):
             _quote = _get_xmpp_quote_preview("discord", replied_id)
             if _quote:
                 xmpp_text = f"> {_quote}\n{xmpp_text}"
-        tg_text = f"{_html_escape(author, quote=False)}: {_convert_markup(message.content, 'discord', 'telegram')}"
+        tg_text = (
+            f"{_html_escape(author, quote=False)}: "
+            f"{_convert_markup(_strip_manual_quote_for_telegram(message.content), 'discord', 'telegram')}"
+        )
         key = _new_bridge_record(discord=message.id)
 
         if xmpp_bridge:
