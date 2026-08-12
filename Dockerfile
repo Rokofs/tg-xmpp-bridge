@@ -9,7 +9,7 @@ FROM python:3.13-slim
 # исполнения, но всё равно должны быть в образе на случай, если он
 # понадобится позже).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl gnupg ca-certificates && \
+    apt-get install -y --no-install-recommends curl gnupg ca-certificates ffmpeg && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     apt-get clean && rm -rf /var/lib/apt/lists/*

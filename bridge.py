@@ -852,6 +852,28 @@ def _convert_gif_to_webp(path: Path) -> Path:
     return webp_path
 
 
+async def _convert_video_to_webp(path: Path) -> Path:
+    """Перекодирует видео (используется, например, для "гифок" — Telegram
+    внутренне хранит их как .mp4, а не как настоящий .gif) в анимированный
+    webp через ffmpeg. Райзит исключение при любой проблеме (ffmpeg не
+    установлен / не смог декодировать / и т.п.) — вызывающий код должен
+    сам это обработать."""
+    webp_path = path.with_suffix(".webp")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", str(path),
+        "-vcodec", "libwebp", "-filter:v", "fps=fps=15",
+        "-lossless", "0", "-compression_level", "6", "-q:v", "50",
+        "-loop", "0", "-an", "-vsync", "0",
+        str(webp_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _stdout, stderr = await proc.communicate()
+    if proc.returncode != 0 or not webp_path.exists():
+        raise RuntimeError(f"ffmpeg завершился с кодом {proc.returncode}: {stderr.decode(errors='replace')[:300]}")
+    return webp_path
+
+
 async def _download_discord_attachment(attachment) -> Path:
     import aiohttp
 
@@ -1441,13 +1463,27 @@ class XMPPBridge(slixmpp.ClientXMPP):
                     "(для gif/анимаций; вдруг блокировка именно по типу файла)", manual_err,
                 )
                 webp_path = None
-                if filepath.suffix.lower() == ".gif":
+                suffix_lower = filepath.suffix.lower()
+                if suffix_lower == ".gif":
                     try:
                         webp_path = _convert_gif_to_webp(filepath)
                         url = await self._manual_upload_with_browser_headers(webp_path)
                         logger.info("Обходной путь сработал — файл загружен как animated WebP")
                     except Exception:
                         logger.exception("Перекодирование в WebP тоже не помогло — сервер отклоняет файл")
+                        return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
+                    finally:
+                        if webp_path is not None:
+                            webp_path.unlink(missing_ok=True)
+                elif suffix_lower in (".mp4", ".mov", ".webm"):
+                    # Telegram хранит "гифки" внутри как видео (.mp4), а не
+                    # как настоящий .gif — конвертируем через ffmpeg.
+                    try:
+                        webp_path = await _convert_video_to_webp(filepath)
+                        url = await self._manual_upload_with_browser_headers(webp_path)
+                        logger.info("Обходной путь сработал — видео загружено как animated WebP")
+                    except Exception:
+                        logger.exception("Перекодирование видео в WebP тоже не помогло — сервер отклоняет файл")
                         return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
                     finally:
                         if webp_path is not None:
