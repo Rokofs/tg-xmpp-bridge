@@ -1928,11 +1928,19 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if msg.from_user and msg.from_user.id == context.bot.id:
         return
 
-    raw_author_name = msg.from_user.first_name if msg.from_user else "Telegram"
-    author = _colored_author(
-        f"tg:{msg.from_user.id}" if msg.from_user else "tg:unknown",
-        raw_author_name,
-    )
+    if msg.from_user:
+        raw_author_name = msg.from_user.first_name
+        author_key = f"tg:{msg.from_user.id}"
+    elif msg.sender_chat:
+        # Пост из привязанного канала (или анонимный админ, постящий "от
+        # имени группы") приходит с sender_chat вместо from_user —
+        # раньше в таких случаях просто подставлялась заглушка "Telegram".
+        raw_author_name = msg.sender_chat.title or "Telegram"
+        author_key = f"tg:channel:{msg.sender_chat.id}"
+    else:
+        raw_author_name = "Telegram"
+        author_key = "tg:unknown"
+    author = _colored_author(author_key, raw_author_name)
     has_media = any(getattr(msg, attr, None) for attr in _MEDIA_ATTRS)
 
     replied_id = msg.reply_to_message.message_id if msg.reply_to_message else None
@@ -2119,10 +2127,12 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
-    author = _colored_author(
-        f"tg:{msg.from_user.id}" if msg.from_user else "tg:unknown",
-        msg.from_user.first_name if msg.from_user else "Telegram",
-    )
+    if msg.from_user:
+        author = _colored_author(f"tg:{msg.from_user.id}", msg.from_user.first_name)
+    elif msg.sender_chat:
+        author = _colored_author(f"tg:channel:{msg.sender_chat.id}", msg.sender_chat.title or "Telegram")
+    else:
+        author = _colored_author("tg:unknown", "Telegram")
 
     if xmpp_bridge and record.get("xmpp"):
         try:
@@ -2227,6 +2237,13 @@ _last_forward_check: dict = {}  # message_id -> time.monotonic() последн�
 TELEGRAM_FORWARD_CHECK_MIN_INTERVAL = float(
     os.environ.get("TELEGRAM_FORWARD_CHECK_MIN_INTERVAL", str(12 * 3600))
 )
+# Полностью выключает проверку "чужих" сообщений через пересылку+удаление
+# (та самая, что заметно мигает в чате) — например, пока настраиваете
+# MTProto-userbot и хотите временно избежать лишнего шума/мигания.
+# Обычная (дешёвая) проверка своих же сообщений бота продолжает работать.
+TELEGRAM_FORWARD_CHECK_ENABLED = (
+    os.environ.get("TELEGRAM_FORWARD_CHECK_ENABLED", "true").strip().lower() == "true"
+)
 
 
 async def _tg_check_deletions_loop() -> None:
@@ -2262,6 +2279,8 @@ async def _tg_check_deletions_loop() -> None:
             # и не чаще, чем раз в TELEGRAM_FORWARD_CHECK_MIN_INTERVAL сек
             # (иначе получается заметное мигание в чате на каждом проходе).
             if tg_id in _non_editable_tg_messages:
+                if not TELEGRAM_FORWARD_CHECK_ENABLED:
+                    continue
                 last = _last_forward_check.get(tg_id, 0.0)
                 if time.monotonic() - last < TELEGRAM_FORWARD_CHECK_MIN_INTERVAL:
                     continue
