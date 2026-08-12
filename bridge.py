@@ -326,10 +326,32 @@ def _prune_bridge_records() -> None:
             continue
         if record.get("tg") is not None:
             _tg_lookup.pop(record["tg"], None)
+            _non_editable_tg_messages.discard(record["tg"])
+            _last_forward_check.pop(record["tg"], None)
         if record.get("xmpp") is not None:
             _xmpp_lookup.pop(record["xmpp"], None)
         if record.get("discord") is not None:
             _discord_lookup.pop(record["discord"], None)
+
+
+def _forget_record_by_key(key: Optional[str]) -> None:
+    """Полностью убирает связку из памяти — вызывается после того, как
+    удаление сообщения уже разослано на все площадки, чтобы то же самое
+    "мёртвое" сообщение не находилось заново на следующих проверках
+    (иначе бот будет бесконечно пересоздавать заглушку "удалено")."""
+    if not key:
+        return
+    record = _bridge_records.pop(key, None)
+    if not record:
+        return
+    if record.get("tg") is not None:
+        _tg_lookup.pop(record["tg"], None)
+        _non_editable_tg_messages.discard(record["tg"])
+        _last_forward_check.pop(record["tg"], None)
+    if record.get("xmpp") is not None:
+        _xmpp_lookup.pop(record["xmpp"], None)
+    if record.get("discord") is not None:
+        _discord_lookup.pop(record["discord"], None)
 
 
 async def _mirror_reactions(key: str, emojis: set, skip: str) -> None:
@@ -372,13 +394,11 @@ async def _propagate_deletion(record: dict, skip: str) -> None:
 
     if skip != "xmpp" and xmpp_bridge and record.get("xmpp"):
         try:
-            # У retraction (XEP-0424) ненадёжная поддержка в клиентах —
-            # judging by jabagram (похожий проект), решили не полагаться на
-            # неё одну и просто "редактируем" сообщение в заглушку через
-            # тот же механизм правок (retract+resend внутри send_correction).
-            new_xmpp_id = await xmpp_bridge.send_correction("🗑 [сообщение удалено]", record["xmpp"])
-            if new_xmpp_id:
-                record["xmpp"] = new_xmpp_id
+            # Чистый retraction (XEP-0424) без текстовой заглушки — клиенты
+            # с поддержкой удалят сообщение молча. Раньше здесь была правка
+            # на текст "[сообщение удалено]", но она оставляла в чате
+            # видимый мусор вместо реального исчезновения сообщения.
+            await xmpp_bridge.send_retraction(record["xmpp"])
         except Exception:
             logger.exception("Не удалось отправить удаление в XMPP")
 
@@ -960,6 +980,16 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if not self._is_from_peer(msg):
             return
 
+        # Стензы retraction (XEP-0424) часто несут текстовый <body> как
+        # fallback для клиентов без поддержки удаления (например, Monocles
+        # сама подставляет "This message has been retracted by the
+        # sender."). Отдельный обработчик on_xmpp_retraction уже разбирает
+        # такие стензы для пересылки удаления — здесь их нужно
+        # проигнорировать, иначе fallback-текст улетит как обычное новое
+        # сообщение на все площадки.
+        if msg["retract"]["id"]:
+            return
+
         body = (msg["body"] or "").strip()
         oob_url = msg["oob"]["url"] or None
         correction_id = msg["replace"]["id"] or None
@@ -1201,7 +1231,10 @@ class XMPPBridge(slixmpp.ClientXMPP):
         "мёртв" (сообщение удалено)."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         try:
-            self["xep_0424"].send_retraction(JID(XMPP_PEER_JID), original_stanza_id, mtype=mtype)
+            # Для правок не нужно ждать полный набор попыток (это заметно
+            # задержит появление исправленного текста) — двух с короткой
+            # паузой обычно достаточно.
+            await self.send_retraction(original_stanza_id, attempts=2, delay=1.0)
         except Exception:
             logger.exception("Не удалось отправить retraction перед правкой в XMPP")
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=new_text, mtype=mtype)
@@ -1212,11 +1245,24 @@ class XMPPBridge(slixmpp.ClientXMPP):
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
         await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
 
-    async def send_retraction(self, target_stanza_id: str) -> None:
+    async def send_retraction(self, target_stanza_id: str, attempts: int = 3, delay: float = 2.0) -> None:
         """Отправляет удаление (retraction, XEP-0424) ранее отправленного
-        сообщения. send_retraction в slixmpp синхронный (сам вызывает send())."""
+        сообщения — тихо, без текстовой надписи-заглушки для клиентов,
+        не понимающих retraction (include_fallback=False).
+
+        Отправляет НЕСКОЛЬКО раз с паузой: на практике Monocles иногда
+        не обрабатывает одиночную retraction-стензу с первого раза, но
+        с повторных попыток — обрабатывает (замечено при отладке).
+        Ограниченное число попыток — не бесконечный повтор, в отличие
+        от прежнего случайно возникавшего бага с зацикливанием.
+        send_retraction в slixmpp синхронный (сам вызывает send())."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
-        self["xep_0424"].send_retraction(JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype)
+        for i in range(attempts):
+            self["xep_0424"].send_retraction(
+                JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype, include_fallback=False
+            )
+            if i < attempts - 1:
+                await asyncio.sleep(delay)
 
     async def on_xmpp_retraction(self, msg):
         """Входящее удаление сообщения от собеседника — пробрасываем на
@@ -1234,6 +1280,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if not record:
             return
         await _propagate_deletion(record, skip="xmpp")
+        _forget_record_by_key(key)
 
     async def _manual_upload_with_browser_headers(self, filepath: Path) -> str:
         """Запасной путь загрузки: сами запрашиваем слот (id) через
@@ -1516,6 +1563,7 @@ class DiscordBridge(_DiscordBase):
         if not record:
             return
         await _propagate_deletion(record, skip="discord")
+        _forget_record_by_key(key)
 
     async def on_message_edit(self, before, after):
         if self.user and after.author.id == self.user.id:
@@ -1817,6 +1865,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Обрабатывает входящие сообщения Telegram и пересылает их в XMPP/Discord."""
     msg = update.effective_message
     if msg is None:
+        return
+    # Технические пересылки-проверки (см. _tg_check_deletions_loop) — не
+    # настоящие сообщения, пересылать их дальше не нужно.
+    if msg.message_id in _verification_forward_ids:
         return
     # Игнорируем только СВОЁ ЖЕ эхо (не любых ботов вообще — иначе
     # ломается пересылка от сторонних ботов-мостов вроде matrixt2bot).
@@ -2253,8 +2305,44 @@ TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", 
 # съедать весь интервал между проходами.
 TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "0.03"))
 
+# id технических пересылок-проверок (см. "message can't be edited" ниже) —
+# чтобы обычный обработчик сообщений не переслал их дальше как настоящие.
+_verification_forward_ids: set = set()
+
+
+async def _forget_verification_id_later(message_id: int, delay: float = 30.0) -> None:
+    await asyncio.sleep(delay)
+    _verification_forward_ids.discard(message_id)
+
+
+# Сообщения, которые бот не может редактировать (написаны не самим ботом —
+# то есть настоящими людьми, а не переслано ботом с других площадок).
+# Для них editMessageReplyMarkup ВСЕГДА вернёт "message can't be edited" —
+# незачем каждый раз пытаться и проваливаться в запасной способ (пересылка
+# + удаление), это заметно мигает в чате. Проверяем такие сообщения
+# намного реже, отдельным более редким циклом.
+_non_editable_tg_messages: set = set()
+_last_forward_check: dict = {}  # message_id -> time.monotonic() последней проверки пересылкой
+TELEGRAM_FORWARD_CHECK_MIN_INTERVAL = float(
+    os.environ.get("TELEGRAM_FORWARD_CHECK_MIN_INTERVAL", "120")
+)
+
 
 async def _tg_check_deletions_loop() -> None:
+    logger.info(
+        "Проверка удалений Telegram запущена (каждые %s сек, до %s сообщений за проход)",
+        TELEGRAM_DELETE_CHECK_INTERVAL, TELEGRAM_DELETE_CHECK_BATCH,
+    )
+    # Telegram может вернуть разные формулировки для удалённого сообщения
+    # в зависимости от ситуации — проверяем известные варианты сразу.
+    deleted_markers = (
+        "message to edit not found",
+        "message_id_invalid",
+        "message to delete not found",
+        "message to forward not found",
+        "message can't be found",
+    )
+
     while True:
         await asyncio.sleep(TELEGRAM_DELETE_CHECK_INTERVAL)
         if not telegram_app or not TELEGRAM_CHAT_ID:
@@ -2262,25 +2350,85 @@ async def _tg_check_deletions_loop() -> None:
         _prune_bridge_records()
         items = [(k, v) for k, v in _bridge_records.items() if v.get("tg")]
         items = items[-TELEGRAM_DELETE_CHECK_BATCH:]
+
         for key, record in items:
             tg_id = record.get("tg")
             if not tg_id:
                 continue
+
+            # --- "чужие" сообщения (написаны не самим ботом) — не можем
+            # редактировать в принципе, проверяем только через пересылку,
+            # и не чаще, чем раз в TELEGRAM_FORWARD_CHECK_MIN_INTERVAL сек
+            # (иначе получается заметное мигание в чате на каждом проходе).
+            if tg_id in _non_editable_tg_messages:
+                last = _last_forward_check.get(tg_id, 0.0)
+                if time.monotonic() - last < TELEGRAM_FORWARD_CHECK_MIN_INTERVAL:
+                    continue
+                _last_forward_check[tg_id] = time.monotonic()
+
+                try:
+                    forwarded = await telegram_app.bot.forward_message(
+                        chat_id=TELEGRAM_CHAT_ID, from_chat_id=TELEGRAM_CHAT_ID, message_id=tg_id
+                    )
+                    _verification_forward_ids.add(forwarded.message_id)
+                    try:
+                        await telegram_app.bot.delete_message(
+                            chat_id=TELEGRAM_CHAT_ID, message_id=forwarded.message_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Не удалось удалить временную копию (id %s) после проверки пересылкой",
+                            forwarded.message_id,
+                        )
+                    asyncio.create_task(_forget_verification_id_later(forwarded.message_id))
+                except BadRequest as fe:
+                    if any(marker in str(fe).lower() for marker in deleted_markers):
+                        logger.info(
+                            "Обнаружено удаление сообщения Telegram %s (через пересылку) — "
+                            "удаляю на других площадках", tg_id,
+                        )
+                        await _propagate_deletion(record, skip="tg")
+                        _forget_record_by_key(key)
+                        _non_editable_tg_messages.discard(tg_id)
+                        _last_forward_check.pop(tg_id, None)
+                except Exception:
+                    pass
+                await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
+                continue
+
+            # --- обычная (дешёвая) проверка через editMessageReplyMarkup ---
             try:
                 # Безобидно: снимаем клавиатуру, которой и так нет.
                 await telegram_app.bot.edit_message_reply_markup(
                     chat_id=TELEGRAM_CHAT_ID, message_id=tg_id, reply_markup=None
                 )
             except BadRequest as e:
-                if "message to edit not found" in str(e).lower():
+                error_text = str(e).lower()
+                if any(marker in error_text for marker in deleted_markers):
                     logger.info(
                         "Обнаружено удаление сообщения Telegram %s — удаляю на других площадках", tg_id
                     )
                     await _propagate_deletion(record, skip="tg")
-                # остальные BadRequest (например "message is not modified")
-                # означают, что сообщение живо — просто игнорируем.
-            except Exception:
-                pass
+                    _forget_record_by_key(key)
+                elif "message can't be edited" in error_text:
+                    # Сообщение написано не ботом — запоминаем и дальше
+                    # проверяем через пересылку, но редко (см. выше).
+                    # Важно: сразу проставляем "последнюю проверку" сейчас,
+                    # а не ждём следующего цикла — иначе первая пересылка-
+                    # проверка срабатывала бы уже через ~10 сек после
+                    # обнаружения, а не через полный интервал (заметное
+                    # мигание сразу после каждого нового сообщения).
+                    _non_editable_tg_messages.add(tg_id)
+                    _last_forward_check[tg_id] = time.monotonic()
+                elif "message is not modified" not in error_text:
+                    # Неизвестный вариант ошибки — не тот, что мы уже знаем
+                    # как "сообщение живо", и не как "сообщение удалено".
+                    # Логируем, чтобы в следующий раз не гадать вслепую.
+                    logger.info(
+                        "Проверка удаления Telegram %s: неопознанный BadRequest: %s", tg_id, e
+                    )
+            except Exception as e:
+                logger.info("Проверка удаления Telegram %s: прочая ошибка %s: %s", tg_id, type(e).__name__, e)
             await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
 
 
