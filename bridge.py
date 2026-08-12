@@ -1145,14 +1145,18 @@ class XMPPBridge(slixmpp.ClientXMPP):
         effective_body = body
         quote_matched_key = None
 
-        # Структурированного XEP-0461 reply нет — пробуем распознать
-        # "ручную" текстовую цитату (так делает Monocles Chat, а также
-        # мосты вроде matrixt2bot из Matrix) и сопоставить её с недавно
-        # отправленными сообщениями по тексту.
-        if not reply_id and body.startswith(">"):
+        # Пробуем распознать "ручную" текстовую цитату (так делает Monocles
+        # Chat, а также мосты вроде matrixt2bot из Matrix) и сопоставить её
+        # с недавно отправленными сообщениями по тексту. ВАЖНО: делаем это
+        # независимо от наличия структурированного reply — на практике
+        # Monocles иногда добавляет и то, и другое разом (структурированный
+        # <reply> плюс fallback-цитату текстом), и без reply_id её тоже
+        # нужно вычищать из видимого текста.
+        if body.startswith(">"):
             quoted_text, remaining_text = _parse_manual_quote(body)
             if quoted_text:
-                quote_matched_key = _find_key_by_quoted_text(quoted_text)
+                if not reply_id:
+                    quote_matched_key = _find_key_by_quoted_text(quoted_text)
                 # Даже если совпадение НЕ нашлось (например, цитата пришла
                 # из Matrix через несколько "прыжков" и не совпадает ни с
                 # чем в нашей памяти) — всё равно убираем "сырую" цитату
@@ -1210,7 +1214,13 @@ class XMPPBridge(slixmpp.ClientXMPP):
         _remember_xmpp_text(key, body)  # для будущего сопоставления чужих текстовых цитат
 
         if local_path is not None:
-            base = effective_body if effective_body and effective_body != oob_url else ""
+            base = effective_body or ""
+            if oob_url and base:
+                # Некоторые клиенты (замечено на Monocles) дублируют ссылку
+                # на файл ещё и текстом внутри тела сообщения, хотя она уже
+                # есть в самом OOB-вложении — убираем дубликат, раз файл и
+                # так пересылается как настоящее вложение.
+                base = base.replace(oob_url, "").strip()
             caption_tg = (
                 f"{_html_escape(display_sender, quote=False)}: "
                 f"{_convert_markup(_strip_manual_quote_for_telegram(base), 'xmpp', 'telegram')}"
