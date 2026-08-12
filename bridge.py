@@ -493,6 +493,17 @@ def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
             continue
         if quoted in text or text in quoted:
             return key
+    # ВРЕМЕННАЯ ДИАГНОСТИКА: совпадение не нашлось — печатаем repr()
+    # (видны скрытые/невидимые символы, которые иногда вставляет
+    # Monocles) и несколько последних запомненных текстов для сравнения.
+    try:
+        recent_sample = [(k, t) for k, t, _ts in list(reversed(_recent_xmpp_texts))[:5]]
+        logger.info(
+            "ДИАГНОСТИКА: не нашлось совпадение цитаты. quoted=%r; последние запомненные тексты: %r",
+            quoted, recent_sample,
+        )
+    except Exception:
+        pass
     return None
 
 
@@ -2337,12 +2348,12 @@ async def _start_healthcheck_server():
 # Чтобы отключить — удалите/закомментируйте вызов
 # asyncio.create_task(_tg_check_deletions_loop()) в main().
 
-TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "60"))
-TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "200"))
+TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "300"))
+TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "30"))
 # Пауза между отдельными проверками внутри одного прохода — весь проход
 # должен укладываться в разумное время, не съедая весь интервал между
 # проходами и не отбирая лимит запросов у обычной пересылки сообщений.
-TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "0.3"))
+TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "1.0"))
 
 # id технических пересылок-проверок (см. "message can't be edited" ниже) —
 # чтобы обычный обработчик сообщений не переслал их дальше как настоящие.
