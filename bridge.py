@@ -1301,9 +1301,15 @@ class XMPPBridge(slixmpp.ClientXMPP):
         работает и что-то показывает — сначала удаляем старое сообщение,
         затем шлём новое с текстом (оно всё равно содержит <replace> —
         клиенты, которые его понимают, всё равно отредактируют на месте,
-        не заметив предшествующий retract). Возвращает id новой стензы —
-        вызывающий код должен обновить им связку, т.к. старый id теперь
-        "мёртв" (сообщение удалено)."""
+        не заметив предшествующий retract).
+
+        Новое сообщение ЗАОДНО отправляется как reply (XEP-0461) на
+        оригинал — так, даже если клиент показывает его как отдельное
+        сообщение, видно, что это ответ/продолжение того самого, а не
+        случайное новое (меньше путаницы для читающих).
+
+        Возвращает id новой стензы — вызывающий код должен обновить им
+        связку, т.к. старый id теперь "мёртв" (сообщение удалено)."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         try:
             # Для правок не нужно ждать полный набор попыток (это заметно
@@ -1312,8 +1318,25 @@ class XMPPBridge(slixmpp.ClientXMPP):
             await self.send_retraction(original_stanza_id, attempts=2, delay=1.0)
         except Exception:
             logger.exception("Не удалось отправить retraction перед правкой в XMPP")
-        stanza = self.make_message(mto=XMPP_PEER_JID, mbody=new_text, mtype=mtype)
+
+        # Текстовая цитата — по той же схеме, что и для обычных reply.
+        # Структурированный <reply> ниже не гарантированно отрисовывается
+        # (см. известные ограничения в README), а текст виден всегда.
+        mbody = new_text
+        key_for_quote = _xmpp_lookup.get(original_stanza_id)
+        if key_for_quote:
+            for k, text, _ts in reversed(_recent_xmpp_texts):
+                if k == key_for_quote:
+                    snippet = text.strip().replace("\n", " ")
+                    if len(snippet) > 150:
+                        snippet = snippet[:150].rstrip() + "…"
+                    mbody = f"> {snippet}\n{new_text}"
+                    break
+
+        stanza = self.make_message(mto=XMPP_PEER_JID, mbody=mbody, mtype=mtype)
         stanza["replace"]["id"] = original_stanza_id
+        stanza["reply"]["id"] = original_stanza_id
+        stanza["reply"]["to"] = _own_xmpp_reply_jid()
         stanza.send()
         return stanza["id"]
 
