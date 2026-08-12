@@ -2155,6 +2155,154 @@ async def _start_healthcheck_server():
     return runner
 
 
+# ============================================================================
+# ПРОВЕРКА УДАЛЁННЫХ СООБЩЕНИЙ TELEGRAM — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
+# Telegram Bot API НЕ присылает ботам событие "сообщение удалено" — это
+# жёсткое ограничение платформы, обойти нельзя. Единственный известный
+# обходной путь — периодически пробовать безобидную "правку" сообщения
+# (снятие несуществующей инлайн-клавиатуры): если сообщение удалено,
+# Telegram ответит ошибкой "message to edit not found"; если нет —
+# либо тихо подтвердит, либо скажет "message is not modified" (тоже
+# значит "жив"). Проверяем только сообщения, которые уже отслеживает
+# мост (не более TELEGRAM_DELETE_CHECK_BATCH штук за раз, реже одного
+# раза в TELEGRAM_DELETE_CHECK_INTERVAL секунд — чтобы не долбить API).
+#
+# Чтобы отключить — удалите/закомментируйте вызов
+# asyncio.create_task(_tg_check_deletions_loop()) в main().
+
+TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "10"))
+TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "500"))
+# Пауза между отдельными проверками внутри одного прохода — весь проход
+# должен укладываться в несколько секунд, чтобы не съедать весь
+# интервал между проходами.
+TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "0.03"))
+
+# id технических пересылок-проверок (см. "message can't be edited" ниже) —
+# чтобы обычный обработчик сообщений не переслал их дальше как настоящие.
+_verification_forward_ids: set = set()
+
+
+async def _forget_verification_id_later(message_id: int, delay: float = 30.0) -> None:
+    await asyncio.sleep(delay)
+    _verification_forward_ids.discard(message_id)
+
+
+# Сообщения, которые бот не может редактировать (написаны не самим ботом —
+# то есть настоящими людьми, а не переслано ботом с других площадок).
+# Для них editMessageReplyMarkup ВСЕГДА вернёт "message can't be edited" —
+# незачем каждый раз пытаться и проваливаться в запасной способ (пересылка
+# + удаление), это заметно мигает в чате. Проверяем такие сообщения
+# намного реже, отдельным более редким циклом.
+_non_editable_tg_messages: set = set()
+_last_forward_check: dict = {}  # message_id -> time.monotonic() последней проверки пересылкой
+TELEGRAM_FORWARD_CHECK_MIN_INTERVAL = float(
+    os.environ.get("TELEGRAM_FORWARD_CHECK_MIN_INTERVAL", str(12 * 3600))
+)
+
+
+async def _tg_check_deletions_loop() -> None:
+    logger.info(
+        "Проверка удалений Telegram запущена (каждые %s сек, до %s сообщений за проход)",
+        TELEGRAM_DELETE_CHECK_INTERVAL, TELEGRAM_DELETE_CHECK_BATCH,
+    )
+    # Telegram может вернуть разные формулировки для удалённого сообщения
+    # в зависимости от ситуации — проверяем известные варианты сразу.
+    deleted_markers = (
+        "message to edit not found",
+        "message_id_invalid",
+        "message to delete not found",
+        "message to forward not found",
+        "message can't be found",
+    )
+
+    while True:
+        await asyncio.sleep(TELEGRAM_DELETE_CHECK_INTERVAL)
+        if not telegram_app or not TELEGRAM_CHAT_ID:
+            continue
+        _prune_bridge_records()
+        items = [(k, v) for k, v in _bridge_records.items() if v.get("tg")]
+        items = items[-TELEGRAM_DELETE_CHECK_BATCH:]
+
+        for key, record in items:
+            tg_id = record.get("tg")
+            if not tg_id:
+                continue
+
+            # --- "чужие" сообщения (написаны не самим ботом) — не можем
+            # редактировать в принципе, проверяем только через пересылку,
+            # и не чаще, чем раз в TELEGRAM_FORWARD_CHECK_MIN_INTERVAL сек
+            # (иначе получается заметное мигание в чате на каждом проходе).
+            if tg_id in _non_editable_tg_messages:
+                last = _last_forward_check.get(tg_id, 0.0)
+                if time.monotonic() - last < TELEGRAM_FORWARD_CHECK_MIN_INTERVAL:
+                    continue
+                _last_forward_check[tg_id] = time.monotonic()
+
+                try:
+                    forwarded = await telegram_app.bot.forward_message(
+                        chat_id=TELEGRAM_CHAT_ID, from_chat_id=TELEGRAM_CHAT_ID, message_id=tg_id
+                    )
+                    _verification_forward_ids.add(forwarded.message_id)
+                    try:
+                        await telegram_app.bot.delete_message(
+                            chat_id=TELEGRAM_CHAT_ID, message_id=forwarded.message_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Не удалось удалить временную копию (id %s) после проверки пересылкой",
+                            forwarded.message_id,
+                        )
+                    asyncio.create_task(_forget_verification_id_later(forwarded.message_id))
+                except BadRequest as fe:
+                    if any(marker in str(fe).lower() for marker in deleted_markers):
+                        logger.info(
+                            "Обнаружено удаление сообщения Telegram %s (через пересылку) — "
+                            "удаляю на других площадках", tg_id,
+                        )
+                        await _propagate_deletion(record, skip="tg")
+                        _forget_record_by_key(key)
+                        _non_editable_tg_messages.discard(tg_id)
+                        _last_forward_check.pop(tg_id, None)
+                except Exception:
+                    pass
+                await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
+                continue
+
+            # --- обычная (дешёвая) проверка через editMessageReplyMarkup ---
+            try:
+                # Безобидно: снимаем клавиатуру, которой и так нет.
+                await telegram_app.bot.edit_message_reply_markup(
+                    chat_id=TELEGRAM_CHAT_ID, message_id=tg_id, reply_markup=None
+                )
+            except BadRequest as e:
+                error_text = str(e).lower()
+                if any(marker in error_text for marker in deleted_markers):
+                    logger.info(
+                        "Обнаружено удаление сообщения Telegram %s — удаляю на других площадках", tg_id
+                    )
+                    await _propagate_deletion(record, skip="tg")
+                    _forget_record_by_key(key)
+                elif "message can't be edited" in error_text:
+                    # Сообщение написано не ботом — запоминаем и дальше
+                    # проверяем через пересылку, но редко (см. выше).
+                    # Важно: сразу проставляем "последнюю проверку" сейчас,
+                    # а не ждём следующего цикла — иначе первая пересылка-
+                    # проверка срабатывала бы уже через ~10 сек после
+                    # обнаружения, а не через полный интервал (заметное
+                    # мигание сразу после каждого нового сообщения).
+                    _non_editable_tg_messages.add(tg_id)
+                    _last_forward_check[tg_id] = time.monotonic()
+                elif "message is not modified" not in error_text:
+                    # Неизвестный вариант ошибки — не тот, что мы уже знаем
+                    # как "сообщение живо", и не как "сообщение удалено".
+                    # Логируем, чтобы в следующий раз не гадать вслепую.
+                    logger.info(
+                        "Проверка удаления Telegram %s: неопознанный BadRequest: %s", tg_id, e
+                    )
+            except Exception as e:
+                logger.info("Проверка удаления Telegram %s: прочая ошибка %s: %s", tg_id, type(e).__name__, e)
+            await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
+
 
 # ========================================================================
 # ЗАПУСК
