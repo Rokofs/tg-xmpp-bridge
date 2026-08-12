@@ -442,6 +442,14 @@ def _get_xmpp_quote_preview(origin: str, replied_native_id) -> Optional[str]:
         return None
     for k, text, _ts in reversed(_recent_xmpp_texts):
         if k == key:
+            # Если цитируемое сообщение само уже содержит вложенную цитату
+            # (например, это был чей-то предыдущий ответ) — берём только
+            # "новую" часть, а не всё целиком. Иначе с каждым следующим
+            # ответом в цепочке цитата разрастается ("> > > > ...").
+            if text.strip().startswith(">"):
+                _quoted, remaining = _parse_manual_quote(text)
+                if remaining:
+                    text = remaining
             snippet = text.strip().replace("\n", " ")
             if len(snippet) > 150:
                 snippet = snippet[:150].rstrip() + "…"
@@ -1116,14 +1124,20 @@ class XMPPBridge(slixmpp.ClientXMPP):
         quote_matched_key = None
 
         # Структурированного XEP-0461 reply нет — пробуем распознать
-        # "ручную" текстовую цитату (так делает Monocles Chat) и
-        # сопоставить её с недавно отправленными сообщениями по тексту.
+        # "ручную" текстовую цитату (так делает Monocles Chat, а также
+        # мосты вроде matrixt2bot из Matrix) и сопоставить её с недавно
+        # отправленными сообщениями по тексту.
         if not reply_id and body.startswith(">"):
             quoted_text, remaining_text = _parse_manual_quote(body)
             if quoted_text:
                 quote_matched_key = _find_key_by_quoted_text(quoted_text)
-                if quote_matched_key:
-                    effective_body = remaining_text
+                # Даже если совпадение НЕ нашлось (например, цитата пришла
+                # из Matrix через несколько "прыжков" и не совпадает ни с
+                # чем в нашей памяти) — всё равно убираем "сырую" цитату
+                # из видимого текста. Иначе на другие площадки улетает
+                # разрастающийся ком вложенных "> > > >" при каждой
+                # следующей связке ответов.
+                effective_body = remaining_text
 
         # Ответ одним (или несколькими) эмодзи на пересланное сообщение —
         # считаем это реакцией, а не обычным ответом (полезно, если в
