@@ -193,6 +193,20 @@ BRIDGE_ENABLED = bool(TELEGRAM_CHAT_ID and (XMPP_ENABLED or DISCORD_ENABLED))
 # при рабочем интернете. TELEGRAM_FORCE_IPV4=true чинит это.
 TELEGRAM_FORCE_IPV4 = os.environ.get("TELEGRAM_FORCE_IPV4", "false").strip().lower() == "true"
 
+# ============================================================================
+# TELEGRAM USERBOT (MTProto/Telethon) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
+# Обычный Bot API в принципе не сообщает боту об удалении чужих (не самим
+# ботом отправленных) сообщений — см. подробный разбор в README. Обойти
+# это можно только полноценным входом в отдельный Telegram-аккаунт через
+# MTProto (см. generate_session.py) — тогда удаления обнаруживаются
+# МГНОВЕННО через событие, а не через периодический опрос.
+# Чтобы отключить — не задавайте TELEGRAM_USERBOT_SESSION.
+TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+TELEGRAM_USERBOT_SESSION = os.environ.get("TELEGRAM_USERBOT_SESSION", "").strip()
+TELEGRAM_USERBOT_ENABLED = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_USERBOT_SESSION)
+# ============================================================================
+
 # Сколько секунд после отправки сообщение можно ещё отредактировать и
 # получить исправление на других площадках.
 EDIT_WINDOW_SECONDS = int(os.environ.get("EDIT_WINDOW_SECONDS", "300"))
@@ -2319,6 +2333,94 @@ async def _tg_check_deletions_loop() -> None:
             await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
 
 
+# ============================================================================
+# TELEGRAM USERBOT (MTProto/Telethon) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
+# Мгновенное обнаружение удаления ЛЮБЫХ сообщений в чате (не только своих)
+# через полноценный вход в отдельный Telegram-аккаунт — см. комментарий у
+# TELEGRAM_USERBOT_ENABLED в начале файла и generate_session.py рядом.
+# Работает только для супергрупп (обычные "маленькие" группы Telegram не
+# используют единую нумерацию сообщений, как супергруппы и каналы — и в
+# любом случае для нашего моста нужна именно супергруппа, чтобы у
+# сообщений был стабильный числовой id).
+
+_telegram_userbot = None
+
+
+def _tg_chat_ids_match(a: int, b: int) -> bool:
+    """Сравнивает id чата с поправкой на то, что Telethon и Bot API иногда
+    представляют id супергрупп по-разному (с "-100" в начале или без)."""
+
+    def _core(x: int) -> int:
+        s = str(abs(x))
+        if s.startswith("100") and len(s) > 3:
+            s = s[3:]
+        return int(s)
+
+    return _core(a) == _core(b)
+
+
+async def _start_telegram_userbot() -> None:
+    global _telegram_userbot
+    if not TELEGRAM_USERBOT_ENABLED:
+        return
+
+    try:
+        from telethon import TelegramClient as _TelethonClient
+        from telethon import events as _telethon_events
+        from telethon.sessions import StringSession as _TelethonStringSession
+    except ImportError:
+        logger.error(
+            "TELEGRAM_USERBOT_SESSION задан, но telethon не установлен "
+            "(pip install telethon) — мгновенное обнаружение удалений отключено"
+        )
+        return
+
+    try:
+        client = _TelethonClient(
+            _TelethonStringSession(TELEGRAM_USERBOT_SESSION),
+            int(TELEGRAM_API_ID), TELEGRAM_API_HASH,
+        )
+        await client.start()
+        _telegram_userbot = client
+
+        @client.on(_telethon_events.MessageDeleted())
+        async def _on_tg_message_deleted(event):
+            if event.chat_id is None:
+                return  # Telegram не всегда указывает чат при удалении — ничего не поделать
+            if not _tg_chat_ids_match(event.chat_id, TELEGRAM_CHAT_ID):
+                return
+            for mid in event.deleted_ids:
+                _prune_bridge_records()
+                key = _tg_lookup.get(mid)
+                if not key:
+                    continue
+                record = _bridge_records.get(key)
+                if not record:
+                    continue
+                logger.info(
+                    "MTProto: мгновенно обнаружено удаление сообщения Telegram %s — "
+                    "удаляю на других площадках", mid,
+                )
+                await _propagate_deletion(record, skip="tg")
+                _forget_record_by_key(key)
+
+        me = await client.get_me()
+        logger.info(
+            "MTProto-аккаунт подключён (%s) — удаления в Telegram теперь обнаруживаются мгновенно",
+            getattr(me, "username", None) or getattr(me, "phone", "?"),
+        )
+    except Exception:
+        logger.exception("Не удалось подключить MTProto-аккаунт для отслеживания удалений")
+
+
+async def _stop_telegram_userbot() -> None:
+    if _telegram_userbot is not None:
+        try:
+            await _telegram_userbot.disconnect()
+        except Exception:
+            pass
+
+
 # ========================================================================
 # ЗАПУСК
 # ========================================================================
@@ -2327,6 +2429,7 @@ async def main() -> None:
     global telegram_app, xmpp_bridge, discord_bridge
 
     healthcheck_runner = await _start_healthcheck_server()
+    await _start_telegram_userbot()
 
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
 
@@ -2419,6 +2522,7 @@ async def main() -> None:
                 await discord_bridge.close()
             if healthcheck_runner is not None:
                 await healthcheck_runner.cleanup()
+            await _stop_telegram_userbot()
 
 
 if __name__ == "__main__":
