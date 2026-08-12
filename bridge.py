@@ -1076,6 +1076,15 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if msg["retract"]["id"]:
             return
 
+        # То же самое с реакциями (XEP-0444) — Monocles шлёт structured
+        # <reactions> ВМЕСТЕ с текстовым fallback-телом (цитата + сам
+        # эмодзи) для клиентов без поддержки реакций. on_xmpp_reactions
+        # уже обрабатывает такие стензы отдельно — здесь их надо
+        # проигнорировать, иначе fallback-текст улетит как отдельное
+        # новое сообщение вдобавок к самой реакции.
+        if msg["reactions"]["id"]:
+            return
+
         body = (msg["body"] or "").strip()
         oob_url = msg["oob"]["url"] or None
         correction_id = msg["replace"]["id"] or None
@@ -1344,7 +1353,9 @@ class XMPPBridge(slixmpp.ClientXMPP):
         return stanza["id"]
 
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
-        await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
+        # send_reactions в этой версии slixmpp синхронный (как и
+        # send_retraction) — сам вызывает send() внутри, awaitить не нужно.
+        self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
 
     async def send_retraction_reliable(self, target_stanza_id: str) -> None:
         """Настоящее удаление сообщений (не правок) — реализовано через тот
