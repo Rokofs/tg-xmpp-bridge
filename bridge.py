@@ -1161,7 +1161,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
             # пометку не показывает вообще — дописываем текстом сами.
             text_tg = (
                 f"{_html_escape(display_sender, quote=False)}: "
-                f"{_convert_markup(body, 'xmpp', 'telegram')} (ред.)"
+                f"{_convert_markup(_strip_manual_quote_for_telegram(body), 'xmpp', 'telegram')} (ред.)"
             )
             text_discord = f"{display_sender}: {_convert_markup(body, 'xmpp', 'discord')}"
 
@@ -1875,7 +1875,7 @@ class DiscordBridge(_DiscordBase):
         xmpp_text = f"{author}: {_convert_markup(after.content, 'discord', 'xmpp')} (ред.)"
         tg_text = (
             f"{_html_escape(author, quote=False)}: "
-            f"{_convert_markup(after.content, 'discord', 'telegram')} (ред.)"
+            f"{_convert_markup(_strip_manual_quote_for_telegram(after.content), 'discord', 'telegram')} (ред.)"
         )
 
         if xmpp_bridge and record.get("xmpp"):
