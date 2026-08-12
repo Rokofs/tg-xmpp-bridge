@@ -1263,9 +1263,14 @@ class XMPPBridge(slixmpp.ClientXMPP):
         от прежнего случайно возникавшего бага с зацикливанием.
         send_retraction в slixmpp синхронный (сам вызывает send())."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
+        # ВРЕМЕННЫЙ ТЕСТ: include_fallback=True — проверяем гипотезу, что
+        # сервер (xmpp.jp) не ретранслирует в комнату сообщения совсем
+        # без <body> (считает их "пустыми"/служебными). Если после этого
+        # диагностика ниже покажет эхо от сервера — гипотеза подтвердится,
+        # и можно будет вернуть include_fallback=False с явным пустым body.
         for i in range(attempts):
             sent = self["xep_0424"].send_retraction(
-                JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype, include_fallback=False
+                JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype, include_fallback=True
             )
             if i == 0:
                 # ВРЕМЕННАЯ ДИАГНОСТИКА: печатаем ровно то, что реально
