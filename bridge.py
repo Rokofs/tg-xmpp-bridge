@@ -824,6 +824,34 @@ def _convert_static_sticker_to_png(path: Path) -> Path:
         return path
 
 
+def _convert_gif_to_webp(path: Path) -> Path:
+    """Перекодирует анимированный gif в анимированный webp — используется
+    как запасной способ, когда сервер (замечено на xmpp.jp) отклоняет
+    загрузку именно gif/видео с 405, но принимает другие форматы.
+    Райзит исключение, если Pillow не установлен или что-то пошло не так
+    (вызывающий код должен сам это обработать)."""
+    from PIL import Image
+
+    webp_path = path.with_suffix(".webp")
+    with Image.open(path) as im:
+        frames = []
+        durations = []
+        try:
+            while True:
+                frames.append(im.convert("RGBA").copy())
+                durations.append(im.info.get("duration", 100))
+                im.seek(im.tell() + 1)
+        except EOFError:
+            pass
+        if not frames:
+            raise RuntimeError("не удалось прочитать ни одного кадра gif")
+        frames[0].save(
+            webp_path, "WEBP", save_all=True,
+            append_images=frames[1:], duration=durations, loop=0,
+        )
+    return webp_path
+
+
 async def _download_discord_attachment(attachment) -> Path:
     import aiohttp
 
@@ -1407,9 +1435,26 @@ class XMPPBridge(slixmpp.ClientXMPP):
             try:
                 url = await self._manual_upload_with_browser_headers(filepath)
                 logger.info("Обходной путь сработал — файл загружен вручную с браузерными заголовками")
-            except Exception:
-                logger.exception("Обходной путь тоже не сработал — сервер отклоняет файл")
-                return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
+            except Exception as manual_err:
+                logger.warning(
+                    "Ручная загрузка тоже не сработала (%s) — пробую перекодировать в WebP "
+                    "(для gif/анимаций; вдруг блокировка именно по типу файла)", manual_err,
+                )
+                webp_path = None
+                if filepath.suffix.lower() == ".gif":
+                    try:
+                        webp_path = _convert_gif_to_webp(filepath)
+                        url = await self._manual_upload_with_browser_headers(webp_path)
+                        logger.info("Обходной путь сработал — файл загружен как animated WebP")
+                    except Exception:
+                        logger.exception("Перекодирование в WebP тоже не помогло — сервер отклоняет файл")
+                        return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
+                    finally:
+                        if webp_path is not None:
+                            webp_path.unlink(missing_ok=True)
+                else:
+                    logger.exception("Обходной путь тоже не сработал — сервер отклоняет файл")
+                    return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
         except IqError as e:
             logger.exception("Ошибка загрузки файла на XMPP-сервер")
             return await self.send_text(f"{caption} (ошибка загрузки файла: {e})".strip())
@@ -1709,6 +1754,10 @@ class DiscordBridge(_DiscordBase):
         try:
             message = await self.bridge_channel.fetch_message(discord_message_id)
             await message.delete()
+        except discord.errors.NotFound:
+            # Уже удалено (например, другой путь обнаружения удаления
+            # сработал параллельно чуть раньше) — не ошибка, просто гонка.
+            pass
         except Exception:
             logger.exception("Не удалось удалить сообщение в Discord")
 
@@ -2372,7 +2421,7 @@ async def _forget_verification_id_later(message_id: int, delay: float = 30.0) ->
 _non_editable_tg_messages: set = set()
 _last_forward_check: dict = {}  # message_id -> time.monotonic() последней проверки пересылкой
 TELEGRAM_FORWARD_CHECK_MIN_INTERVAL = float(
-    os.environ.get("TELEGRAM_FORWARD_CHECK_MIN_INTERVAL", "120")
+    os.environ.get("TELEGRAM_FORWARD_CHECK_MIN_INTERVAL", "900")
 )
 
 
