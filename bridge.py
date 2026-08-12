@@ -485,13 +485,19 @@ def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
     quoted = (quoted or "").strip()
     if not quoted:
         return None
+    # Нормализуем пробельные символы перед сравнением: _parse_manual_quote
+    # склеивает строки цитаты пробелами, а сохранённый оригинал текста
+    # хранит настоящие переносы строк — без нормализации многострочные
+    # сообщения никогда не совпадут как подстрока.
+    quoted_normalized = " ".join(quoted.split())
     now = time.monotonic()
     for key, text, ts in reversed(_recent_xmpp_texts):
         if now - ts > MESSAGE_MAP_TTL_SECONDS:
             continue
         if key not in _bridge_records:
             continue
-        if quoted in text or text in quoted:
+        text_normalized = " ".join(text.split())
+        if quoted_normalized in text_normalized or text_normalized in quoted_normalized:
             return key
     # ВРЕМЕННАЯ ДИАГНОСТИКА: совпадение не нашлось — печатаем repr()
     # (видны скрытые/невидимые символы, которые иногда вставляет
