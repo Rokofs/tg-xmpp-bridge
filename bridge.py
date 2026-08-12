@@ -975,6 +975,12 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if msg["type"] not in ("chat", "normal", "groupchat"):
             return
         if XMPP_IS_MUC and str(msg["mucnick"]) == XMPP_MUC_NICK:
+            if msg["retract"]["id"]:
+                # ВРЕМЕННАЯ ДИАГНОСТИКА: подтверждает, что сервер комнаты
+                # реально отразил нашу retraction обратно (значит, дело
+                # дошло хотя бы до сервера — дальше уже вопрос к клиенту
+                # получателя или к самому серверу, если этого лога нет).
+                logger.info("ДИАГНОСТИКА: сервер отразил обратно нашу retraction:\n%s", str(msg))
             self._learn_own_stanza_id(msg)
             return
         if not self._is_from_peer(msg):
@@ -1258,9 +1264,18 @@ class XMPPBridge(slixmpp.ClientXMPP):
         send_retraction в slixmpp синхронный (сам вызывает send())."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         for i in range(attempts):
-            self["xep_0424"].send_retraction(
+            sent = self["xep_0424"].send_retraction(
                 JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype, include_fallback=False
             )
+            if i == 0:
+                # ВРЕМЕННАЯ ДИАГНОСТИКА: печатаем ровно то, что реально
+                # уходит на сервер для retraction — чтобы исключить баг в
+                # нашей стороне/slixmpp, прежде чем подозревать сервер
+                # или клиент получателя.
+                try:
+                    logger.info("ДИАГНОСТИКА: отправляю retraction-стензу:\n%s", str(sent))
+                except Exception:
+                    pass
             if i < attempts - 1:
                 await asyncio.sleep(delay)
 
