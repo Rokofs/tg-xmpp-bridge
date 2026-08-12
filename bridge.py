@@ -188,17 +188,6 @@ DISCORD_ENABLED = bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID)
 
 BRIDGE_ENABLED = bool(TELEGRAM_CHAT_ID and (XMPP_ENABLED or DISCORD_ENABLED))
 
-# ============================================================================
-# MINECRAFT (Rustix.me / Pterodactyl) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
-# Чтобы полностью отключить фичу — закомментируйте эти 4 строки (или
-# просто не задавайте MINECRAFT_API_KEY в .env, тогда команда /mcstart
-# сама не зарегистрируется).
-MINECRAFT_PANEL_URL = os.environ.get("MINECRAFT_PANEL_URL", "https://my.rustix.me").strip().rstrip("/")
-MINECRAFT_API_KEY = os.environ.get("MINECRAFT_API_KEY", "").strip() or None
-MINECRAFT_SERVER_ID = os.environ.get("MINECRAFT_SERVER_ID", "").strip() or None
-MINECRAFT_ENABLED = bool(MINECRAFT_API_KEY and MINECRAFT_SERVER_ID)
-# ============================================================================
-
 # Некоторые VPN туннелируют только IPv4, а httpx/anyio по умолчанию
 # сначала пробует IPv6 и подолгу "виснет" — из-за этого TimedOut даже
 # при рабочем интернете. TELEGRAM_FORCE_IPV4=true чинит это.
@@ -263,21 +252,6 @@ def _colored_author(key: str, display_name: str) -> str:
         idx = next(_color_counter) % len(_COLOR_EMOJIS)
         _author_colors[key] = _COLOR_EMOJIS[idx]
     return f"{_author_colors[key]} {display_name}"
-
-
-def _mc_media_label(suffix: str) -> str:
-    """Короткая текстовая метка типа файла для уведомления в Minecraft-чате
-    (без эмодзи — игровой шрифт их не рисует)."""
-    suffix = (suffix or "").lower()
-    if suffix in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
-        return "[фото]"
-    if suffix in (".mp4", ".mov", ".webm"):
-        return "[видео]"
-    if suffix in (".mp3", ".ogg", ".oga", ".wav", ".m4a", ".opus"):
-        return "[аудио]"
-    if suffix in (".tgs",):
-        return "[анимированный стикер]"
-    return "[файл]"
 
 
 def _own_xmpp_reply_jid() -> str:
@@ -1210,10 +1184,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
                         _link_record(key, discord=discord_id)
                     except Exception:
                         logger.exception("Не удалось переслать медиа из XMPP в Discord")
-                if MC_CHAT_BRIDGE_ENABLED:
-                    label = _mc_media_label(local_path.suffix)
-                    caption_part = f" {base}" if base else ""
-                    await _send_to_minecraft_chat(f"{sender}: {label}{caption_part}")
             finally:
                 local_path.unlink(missing_ok=True)
             return
@@ -1251,11 +1221,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 _link_record(key, discord=discord_id)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из XMPP в Discord")
-
-        if MC_CHAT_BRIDGE_ENABLED:
-            mc_text = effective_body if effective_body else (oob_url or "")
-            if mc_text:
-                await _send_to_minecraft_chat(f"{sender}: {mc_text}")
 
     async def on_xmpp_reactions(self, msg):
         """Обрабатывает входящие реакции (XEP-0444) и отражает их на других площадках."""
@@ -1335,8 +1300,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=mbody, mtype=mtype)
         stanza["replace"]["id"] = original_stanza_id
-        stanza["reply"]["id"] = original_stanza_id
-        stanza["reply"]["to"] = _own_xmpp_reply_jid()
         stanza.send()
         return stanza["id"]
 
@@ -1453,21 +1416,34 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
     async def send_file(
         self, filepath: Path, caption: str = "", reply_to: Optional[str] = None,
-        reply_to_jid: Optional[str] = None,
+        reply_to_jid: Optional[str] = None, source_url: Optional[str] = None,
     ) -> Optional[str]:
         """Загружает файл на XMPP-сервер (XEP-0363) и отправляет ссылку с OOB.
+
+        source_url — исходная ссылка на файл (например, прямая ссылка
+        Telegram), на случай, если загрузка на XMPP-сервер вообще не
+        удастся. Тогда вместо текста ошибки просто пришлём эту ссылку —
+        не так красиво, как вложение, но хотя бы кликабельно и без
+        служебного текста про ошибку.
 
         Возвращает id отправленной станзы (для правок/реакций/reply),
         либо None, если файл вообще не удалось отправить.
         """
+
+        async def _fallback_link_or_error(error_note: str) -> Optional[str]:
+            if source_url:
+                text = f"{caption}\n{source_url}".strip() if caption else source_url
+                return await self.send_text(text)
+            return await self.send_text(f"{caption} {error_note}".strip())
+
         try:
             url = await self["xep_0363"].upload_file(str(filepath))
         except UploadServiceNotFound:
             logger.warning("На XMPP-сервере не найден сервис HTTP Upload")
-            return await self.send_text(f"{caption} (сервер не поддерживает загрузку файлов)".strip())
+            return await _fallback_link_or_error("(сервер не поддерживает загрузку файлов)")
         except FileTooBig as e:
             logger.warning("Файл слишком большой для загрузки: %s", e)
-            return await self.send_text(f"{caption} (файл слишком большой для XMPP-сервера)".strip())
+            return await _fallback_link_or_error("(файл слишком большой для XMPP-сервера)")
         except HTTPError as e:
             # Некоторые серверы (замечено на xmpp.jp) отклоняют
             # автоматическую загрузку некоторых типов файлов (видео/gif)
@@ -1493,8 +1469,8 @@ class XMPPBridge(slixmpp.ClientXMPP):
                         url = await self._manual_upload_with_browser_headers(webp_path)
                         logger.info("Обходной путь сработал — файл загружен как animated WebP")
                     except Exception:
-                        logger.exception("Перекодирование в WebP тоже не помогло — сервер отклоняет файл")
-                        return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
+                        logger.warning("Перекодирование в WebP тоже не помогло — сервер отклоняет файл (%s)", e)
+                        return await _fallback_link_or_error(f"(сервер отклонил загрузку файла: {e})")
                     finally:
                         if webp_path is not None:
                             webp_path.unlink(missing_ok=True)
@@ -1506,23 +1482,25 @@ class XMPPBridge(slixmpp.ClientXMPP):
                         url = await self._manual_upload_with_browser_headers(webp_path)
                         logger.info("Обходной путь сработал — видео загружено как animated WebP")
                     except Exception:
-                        logger.exception("Перекодирование видео в WebP тоже не помогло — сервер отклоняет файл")
-                        return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
+                        logger.warning(
+                            "Перекодирование видео в WebP тоже не помогло — сервер отклоняет файл (%s)", e
+                        )
+                        return await _fallback_link_or_error(f"(сервер отклонил загрузку файла: {e})")
                     finally:
                         if webp_path is not None:
                             webp_path.unlink(missing_ok=True)
                 else:
-                    logger.exception("Обходной путь тоже не сработал — сервер отклоняет файл")
-                    return await self.send_text(f"{caption} (сервер отклонил загрузку файла: {e})".strip())
+                    logger.warning("Обходной путь тоже не сработал — сервер отклоняет файл (%s)", e)
+                    return await _fallback_link_or_error(f"(сервер отклонил загрузку файла: {e})")
         except IqError as e:
             logger.exception("Ошибка загрузки файла на XMPP-сервер")
-            return await self.send_text(f"{caption} (ошибка загрузки файла: {e})".strip())
+            return await _fallback_link_or_error(f"(ошибка загрузки файла: {e})")
         except IqTimeout as e:
             logger.exception("Таймаут при загрузке файла на XMPP-сервер")
-            return await self.send_text(f"{caption} (таймаут при загрузке файла: {e})".strip())
+            return await _fallback_link_or_error(f"(таймаут при загрузке файла: {e})")
         except OSError as e:
             logger.exception("Сетевая ошибка при загрузке файла на XMPP-сервер")
-            return await self.send_text(f"{caption} (сетевая ошибка при загрузке файла: {e})".strip())
+            return await _fallback_link_or_error(f"(сетевая ошибка при загрузке файла: {e})")
 
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         body = f"{caption}\n{url}".strip() if caption else url
@@ -1663,10 +1641,6 @@ class DiscordBridge(_DiscordBase):
                             _link_record(key, tg=sent.message_id)
                     except Exception:
                         logger.exception("Не удалось переслать вложение из Discord в Telegram")
-                if MC_CHAT_BRIDGE_ENABLED:
-                    label = _mc_media_label(local_path.suffix)
-                    caption_part = f" {message.content}" if message.content else ""
-                    await _send_to_minecraft_chat(f"{message.author.display_name}: {label}{caption_part}")
             finally:
                 local_path.unlink(missing_ok=True)
 
@@ -1700,9 +1674,6 @@ class DiscordBridge(_DiscordBase):
                 _link_record(key, tg=sent.message_id)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Discord в Telegram")
-
-        if MC_CHAT_BRIDGE_ENABLED:
-            await _send_to_minecraft_chat(f"{message.author.display_name}: {message.content}")
 
     async def on_message_delete(self, message: "discord.Message"):
         if message.channel.id != DISCORD_CHANNEL_ID:
@@ -1912,110 +1883,6 @@ async def tg_handle_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     logger.info("Команда /chatid: chat_id=%s (%s)", chat.id, title)
 
 
-# ============================================================================
-# MINECRAFT (Rustix.me / Pterodactyl) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
-# Чтобы отключить — удалите/закомментируйте вызов add_handler в main()
-# (см. поиск по "mc_start_command") или просто не задавайте
-# MINECRAFT_API_KEY в .env — тогда команда сама не зарегистрируется.
-
-async def _minecraft_power_action(signal: str) -> tuple:
-    """Отправляет команду power-действия (start/stop/restart/kill) через
-    официальный Client API Pterodactyl. Возвращает (успех: bool, текст).
-    """
-    import aiohttp
-
-    url = f"{MINECRAFT_PANEL_URL}/api/client/servers/{MINECRAFT_SERVER_ID}/power"
-    headers = {
-        "Authorization": f"Bearer {MINECRAFT_API_KEY}",
-        "Accept": "Application/vnd.pterodactyl.v1+json",
-        "Content-Type": "application/json",
-        # Некоторые панели стоят за CDN/WAF (замечено на Rustix.me —
-        # cdn.mitelis.net), который блокирует запросы без "браузерных"
-        # заголовков — aiohttp по умолчанию шлёт User-Agent вида
-        # "Python/3.x aiohttp/x.x", что легко детектится как бот.
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Origin": MINECRAFT_PANEL_URL,
-        "Referer": f"{MINECRAFT_PANEL_URL}/server/{MINECRAFT_SERVER_ID}/console",
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json={"signal": signal}) as resp:
-                body = await resp.text()
-                logger.info(
-                    "Minecraft power-action ответ: HTTP %s, тело (первые 300 симв.): %s",
-                    resp.status, body[:300],
-                )
-                if resp.status in (200, 204):
-                    return True, "команда отправлена"
-                clean_body = re.sub(r"<[^>]+>", "", body).strip()
-                return False, f"HTTP {resp.status}: {clean_body[:300]}"
-    except Exception as e:
-        logger.exception("Ошибка запроса к панели Minecraft (Rustix/Pterodactyl)")
-        return False, str(e)
-
-
-async def _minecraft_get_status() -> tuple:
-    """Запрашивает текущее состояние сервера (для диагностики /mcstart)."""
-    import aiohttp
-
-    url = f"{MINECRAFT_PANEL_URL}/api/client/servers/{MINECRAFT_SERVER_ID}/resources"
-    headers = {
-        "Authorization": f"Bearer {MINECRAFT_API_KEY}",
-        "Accept": "Application/vnd.pterodactyl.v1+json",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Origin": MINECRAFT_PANEL_URL,
-        "Referer": f"{MINECRAFT_PANEL_URL}/server/{MINECRAFT_SERVER_ID}/console",
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                body = await resp.text()
-                logger.info(
-                    "Minecraft status-запрос ответ: HTTP %s, тело (первые 300 симв.): %s",
-                    resp.status, body[:300],
-                )
-                if resp.status != 200:
-                    return None, f"HTTP {resp.status}"
-                import json as _json
-                data = _json.loads(body)
-                state = data.get("attributes", {}).get("current_state")
-                return state, None
-    except Exception as e:
-        logger.exception("Ошибка запроса статуса Minecraft-сервера")
-        return None, str(e)
-
-
-async def tg_handle_mcstart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /mcstart — запускает Minecraft-сервер через панель Rustix.me."""
-    chat = update.effective_chat
-    if chat is None:
-        return
-    ok, detail = await _minecraft_power_action("start")
-    if not ok:
-        await context.bot.send_message(chat_id=chat.id, text=f"⚠️ Не удалось запустить сервер: {detail}")
-        logger.warning("Не удалось запустить Minecraft-сервер: %s", detail)
-        return
-
-    await asyncio.sleep(2)  # даём панели секунду обновить статус
-    state, err = await _minecraft_get_status()
-    if err:
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=f"🟢 Команда отправлена, но не удалось проверить статус ({err}).",
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=chat.id, text=f"🟢 Команда отправлена. Текущий статус: `{state}`", parse_mode="Markdown"
-        )
-
-# ========================= /MINECRAFT ======================================
-
 
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает входящие сообщения Telegram и пересылает их в XMPP/Discord."""
@@ -2100,8 +1967,6 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _link_record(key, discord=discord_id)
             except Exception:
                 logger.exception("Не удалось переслать сообщение из Telegram в Discord")
-        if MC_CHAT_BRIDGE_ENABLED:
-            await _send_to_minecraft_chat(f"{raw_author_name}: {msg.text}")
         return
 
     if not has_media:
@@ -2180,6 +2045,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 xmpp_id = await xmpp_bridge.send_file(
                     local_path, caption=caption_xmpp,
                     reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to"),
+                    source_url=file_obj.file_path,
                 )
                 if xmpp_id:
                     _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
@@ -2194,10 +2060,6 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     _link_record(key, discord=discord_id)
             except Exception:
                 logger.exception("Не удалось переслать медиа из Telegram в Discord")
-        if MC_CHAT_BRIDGE_ENABLED:
-            label = _mc_media_label(local_path.suffix)
-            caption_part = f" {msg.caption}" if msg.caption else ""
-            await _send_to_minecraft_chat(f"{raw_author_name}: {label}{caption_part}")
     except Exception:
         logger.exception("Не удалось скачать медиа из Telegram")
     finally:
@@ -2293,317 +2155,6 @@ async def _start_healthcheck_server():
     return runner
 
 
-# ============================================================================
-# MINECRAFT AFK-БОТ (Node.js/mineflayer) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
-# Держит Minecraft-сервер (например, Aternos) "живым", подключаясь как
-# игрок. Запускается как подпроцесс, чтобы жить в том же Render-сервисе
-# и не тратить отдельный лимит бесплатных часов.
-#
-# Чтобы отключить — не задавайте MC_HOST в .env (тогда подпроцесс просто
-# не стартует), либо удалите/закомментируйте вызовы
-# _start_minecraft_afk_bot() / _stop_minecraft_afk_bot() в main().
-
-_minecraft_afk_process = None
-_minecraft_afk_shutting_down = False
-
-
-MC_CHAT_BRIDGE_ENABLED = bool(os.environ.get("MC_HOST"))
-
-
-async def _start_minecraft_afk_bot():
-    global _minecraft_afk_process
-    if not os.environ.get("MC_HOST"):
-        return  # не настроено — не запускаем
-
-    afk_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minecraft_afk")
-    if not os.path.isdir(afk_dir):
-        logger.warning("Папка minecraft_afk не найдена рядом с bridge.py — AFK-бот не запущен")
-        return
-
-    # Не передаём подпроцессу PORT — порт держит только этот, Python,
-    # процесс (иначе Node попробует занять тот же порт и упадёт).
-    env = os.environ.copy()
-    env.pop("PORT", None)
-
-    # Ограничиваем кучу V8 у Node — на бесплатных тарифах (обычно 512 МБ
-    # на весь контейнер) без этого Node может незаметно вырасти и увести
-    # в OOM-килл ВЕСЬ контейнер целиком (вместе с Python-частью моста).
-    # С лимитом упадёт только сам Node-процесс — переподключится по
-    # своей же логике реконнекта, а не потащит за собой всё остальное.
-    # При необходимости поправьте под свой тариф Render через
-    # MC_NODE_MAX_OLD_SPACE_MB (в мегабайтах).
-    max_heap_mb = os.environ.get("MC_NODE_MAX_OLD_SPACE_MB", "160")
-
-    logger.info("Запускаю AFK-бота Minecraft (Node.js/mineflayer)...")
-    try:
-        _minecraft_afk_process = await asyncio.create_subprocess_exec(
-            "node", f"--max-old-space-size={max_heap_mb}", "index.js",
-            cwd=afk_dir,
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        asyncio.create_task(_pipe_minecraft_afk_logs())
-        asyncio.create_task(_watch_minecraft_afk_process())
-    except FileNotFoundError:
-        logger.error(
-            "Не удалось запустить AFK-бота: команда 'node' не найдена. "
-            "Убедитесь, что в окружении установлен Node.js (см. Dockerfile)."
-        )
-    except Exception:
-        logger.exception("Не удалось запустить AFK-бота Minecraft")
-
-
-async def _pipe_minecraft_afk_logs():
-    """Читает stdout Node-подпроцесса: обычные строки — в общий лог,
-    строки с префиксом MCCHAT_IN: — как сообщения игрового чата,
-    которые нужно переслать на остальные площадки."""
-    if _minecraft_afk_process is None or _minecraft_afk_process.stdout is None:
-        return
-    async for raw_line in _minecraft_afk_process.stdout:
-        line = raw_line.decode(errors="replace").rstrip()
-        if line.startswith("MCCHAT_IN:"):
-            await _handle_minecraft_chat_message(line[len("MCCHAT_IN:"):])
-        else:
-            logger.info("[minecraft-afk] %s", line)
-
-
-async def _handle_minecraft_chat_message(payload_json: str) -> None:
-    """Пересылает сообщение игрового чата Minecraft на Telegram/XMPP/Discord."""
-    import json as _json
-
-    try:
-        data = _json.loads(payload_json)
-    except Exception:
-        logger.warning("Не удалось разобрать сообщение чата Minecraft: %s", payload_json)
-        return
-
-    username = str(data.get("username") or "Minecraft")
-    message = str(data.get("message") or "").strip()
-    if not message:
-        return
-
-    author = _colored_author(f"minecraft:{username}", username)
-    text_tg = f"{_html_escape(author, quote=False)}: {_html_escape(message, quote=False)}"
-    text_other = f"{author}: {message}"
-
-    if telegram_app and TELEGRAM_CHAT_ID:
-        try:
-            await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text_tg, parse_mode="HTML")
-        except Exception:
-            logger.exception("Не удалось переслать сообщение Minecraft-чата в Telegram")
-    if xmpp_bridge:
-        try:
-            await xmpp_bridge.send_text(text_other)
-        except Exception:
-            logger.exception("Не удалось переслать сообщение Minecraft-чата в XMPP")
-    if discord_bridge:
-        try:
-            await discord_bridge.send_text(text_other)
-        except Exception:
-            logger.exception("Не удалось переслать сообщение Minecraft-чата в Discord")
-
-
-async def _send_to_minecraft_chat(text: str) -> None:
-    """Отправляет строку в игровой чат Minecraft через AFK-бота (если он запущен)."""
-    import json as _json
-
-    if not MC_CHAT_BRIDGE_ENABLED or _minecraft_afk_process is None:
-        return
-    if _minecraft_afk_process.stdin is None:
-        return
-    try:
-        line = f"MCCHAT_OUT:{_json.dumps({'text': text[:250]})}\n"
-        _minecraft_afk_process.stdin.write(line.encode())
-        await _minecraft_afk_process.stdin.drain()
-    except Exception:
-        logger.exception("Не удалось отправить сообщение в Minecraft-чат")
-
-
-async def _watch_minecraft_afk_process() -> None:
-    """Если Node-подпроцесс неожиданно завершился (например, упёрся в
-    лимит памяти) — перезапускаем его заново через паузу, а не
-    оставляем мёртвым до следующего деплоя."""
-    process = _minecraft_afk_process
-    if process is None:
-        return
-    returncode = await process.wait()
-    if _minecraft_afk_shutting_down:
-        return  # это штатная остановка при выключении бота, не ошибка
-    logger.warning(
-        "AFK-бот Minecraft неожиданно завершился (код %s) — перезапускаю через 10 сек",
-        returncode,
-    )
-    await asyncio.sleep(10)
-    await _start_minecraft_afk_bot()
-
-
-# ============================================================================
-# ПРОВЕРКА УДАЛЁННЫХ СООБЩЕНИЙ TELEGRAM — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
-# Telegram Bot API НЕ присылает ботам событие "сообщение удалено" — это
-# жёсткое ограничение платформы, обойти нельзя. Единственный известный
-# обходной путь — периодически пробовать безобидную "правку" сообщения
-# (снятие несуществующей инлайн-клавиатуры): если сообщение удалено,
-# Telegram ответит ошибкой "message to edit not found"; если нет —
-# либо тихо подтвердит, либо скажет "message is not modified" (тоже
-# значит "жив"). Проверяем только сообщения, которые уже отслеживает
-# мост (не более TELEGRAM_DELETE_CHECK_BATCH штук за раз, реже одного
-# раза в TELEGRAM_DELETE_CHECK_INTERVAL секунд — чтобы не долбить API).
-#
-# Чтобы отключить — удалите/закомментируйте вызов
-# asyncio.create_task(_tg_check_deletions_loop()) в main().
-
-TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "10"))
-TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "200"))
-# Пауза между отдельными проверками внутри одного прохода — весь проход
-# (до 200 сообщений) должен укладываться в несколько секунд, чтобы не
-# съедать весь интервал между проходами.
-TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "0.03"))
-
-# id технических пересылок-проверок (см. "message can't be edited" ниже) —
-# чтобы обычный обработчик сообщений не переслал их дальше как настоящие.
-_verification_forward_ids: set = set()
-
-
-async def _forget_verification_id_later(message_id: int, delay: float = 30.0) -> None:
-    await asyncio.sleep(delay)
-    _verification_forward_ids.discard(message_id)
-
-
-# Сообщения, которые бот не может редактировать (написаны не самим ботом —
-# то есть настоящими людьми, а не переслано ботом с других площадок).
-# Для них editMessageReplyMarkup ВСЕГДА вернёт "message can't be edited" —
-# незачем каждый раз пытаться и проваливаться в запасной способ (пересылка
-# + удаление), это заметно мигает в чате. Проверяем такие сообщения
-# намного реже, отдельным более редким циклом.
-_non_editable_tg_messages: set = set()
-_last_forward_check: dict = {}  # message_id -> time.monotonic() последней проверки пересылкой
-TELEGRAM_FORWARD_CHECK_MIN_INTERVAL = float(
-    os.environ.get("TELEGRAM_FORWARD_CHECK_MIN_INTERVAL", "900")
-)
-
-
-async def _tg_check_deletions_loop() -> None:
-    logger.info(
-        "Проверка удалений Telegram запущена (каждые %s сек, до %s сообщений за проход)",
-        TELEGRAM_DELETE_CHECK_INTERVAL, TELEGRAM_DELETE_CHECK_BATCH,
-    )
-    # Telegram может вернуть разные формулировки для удалённого сообщения
-    # в зависимости от ситуации — проверяем известные варианты сразу.
-    deleted_markers = (
-        "message to edit not found",
-        "message_id_invalid",
-        "message to delete not found",
-        "message to forward not found",
-        "message can't be found",
-    )
-
-    while True:
-        await asyncio.sleep(TELEGRAM_DELETE_CHECK_INTERVAL)
-        if not telegram_app or not TELEGRAM_CHAT_ID:
-            continue
-        _prune_bridge_records()
-        items = [(k, v) for k, v in _bridge_records.items() if v.get("tg")]
-        items = items[-TELEGRAM_DELETE_CHECK_BATCH:]
-
-        for key, record in items:
-            tg_id = record.get("tg")
-            if not tg_id:
-                continue
-
-            # --- "чужие" сообщения (написаны не самим ботом) — не можем
-            # редактировать в принципе, проверяем только через пересылку,
-            # и не чаще, чем раз в TELEGRAM_FORWARD_CHECK_MIN_INTERVAL сек
-            # (иначе получается заметное мигание в чате на каждом проходе).
-            if tg_id in _non_editable_tg_messages:
-                last = _last_forward_check.get(tg_id, 0.0)
-                if time.monotonic() - last < TELEGRAM_FORWARD_CHECK_MIN_INTERVAL:
-                    continue
-                _last_forward_check[tg_id] = time.monotonic()
-
-                try:
-                    forwarded = await telegram_app.bot.forward_message(
-                        chat_id=TELEGRAM_CHAT_ID, from_chat_id=TELEGRAM_CHAT_ID, message_id=tg_id
-                    )
-                    _verification_forward_ids.add(forwarded.message_id)
-                    try:
-                        await telegram_app.bot.delete_message(
-                            chat_id=TELEGRAM_CHAT_ID, message_id=forwarded.message_id
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Не удалось удалить временную копию (id %s) после проверки пересылкой",
-                            forwarded.message_id,
-                        )
-                    asyncio.create_task(_forget_verification_id_later(forwarded.message_id))
-                except BadRequest as fe:
-                    if any(marker in str(fe).lower() for marker in deleted_markers):
-                        logger.info(
-                            "Обнаружено удаление сообщения Telegram %s (через пересылку) — "
-                            "удаляю на других площадках", tg_id,
-                        )
-                        await _propagate_deletion(record, skip="tg")
-                        _forget_record_by_key(key)
-                        _non_editable_tg_messages.discard(tg_id)
-                        _last_forward_check.pop(tg_id, None)
-                except Exception:
-                    pass
-                await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
-                continue
-
-            # --- обычная (дешёвая) проверка через editMessageReplyMarkup ---
-            try:
-                # Безобидно: снимаем клавиатуру, которой и так нет.
-                await telegram_app.bot.edit_message_reply_markup(
-                    chat_id=TELEGRAM_CHAT_ID, message_id=tg_id, reply_markup=None
-                )
-            except BadRequest as e:
-                error_text = str(e).lower()
-                if any(marker in error_text for marker in deleted_markers):
-                    logger.info(
-                        "Обнаружено удаление сообщения Telegram %s — удаляю на других площадках", tg_id
-                    )
-                    await _propagate_deletion(record, skip="tg")
-                    _forget_record_by_key(key)
-                elif "message can't be edited" in error_text:
-                    # Сообщение написано не ботом — запоминаем и дальше
-                    # проверяем через пересылку, но редко (см. выше).
-                    # Важно: сразу проставляем "последнюю проверку" сейчас,
-                    # а не ждём следующего цикла — иначе первая пересылка-
-                    # проверка срабатывала бы уже через ~10 сек после
-                    # обнаружения, а не через полный интервал (заметное
-                    # мигание сразу после каждого нового сообщения).
-                    _non_editable_tg_messages.add(tg_id)
-                    _last_forward_check[tg_id] = time.monotonic()
-                elif "message is not modified" not in error_text:
-                    # Неизвестный вариант ошибки — не тот, что мы уже знаем
-                    # как "сообщение живо", и не как "сообщение удалено".
-                    # Логируем, чтобы в следующий раз не гадать вслепую.
-                    logger.info(
-                        "Проверка удаления Telegram %s: неопознанный BadRequest: %s", tg_id, e
-                    )
-            except Exception as e:
-                logger.info("Проверка удаления Telegram %s: прочая ошибка %s: %s", tg_id, type(e).__name__, e)
-            await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
-
-
-async def _stop_minecraft_afk_bot():
-    global _minecraft_afk_shutting_down
-    _minecraft_afk_shutting_down = True
-    if _minecraft_afk_process is None:
-        return
-    try:
-        _minecraft_afk_process.terminate()
-        await asyncio.wait_for(_minecraft_afk_process.wait(), timeout=5)
-    except Exception:
-        try:
-            _minecraft_afk_process.kill()
-        except Exception:
-            pass
-
-# ========================== /MINECRAFT AFK-БОТ =============================
-
 
 # ========================================================================
 # ЗАПУСК
@@ -2613,7 +2164,6 @@ async def main() -> None:
     global telegram_app, xmpp_bridge, discord_bridge
 
     healthcheck_runner = await _start_healthcheck_server()
-    await _start_minecraft_afk_bot()
 
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
 
@@ -2628,10 +2178,6 @@ async def main() -> None:
     telegram_app = builder.build()
 
     telegram_app.add_handler(CommandHandler("chatid", tg_handle_chatid))
-
-    # MINECRAFT: чтобы отключить — удалите/закомментируйте следующие 2 строки.
-    if MINECRAFT_ENABLED:
-        telegram_app.add_handler(CommandHandler("mcstart", tg_handle_mcstart))
 
     allowed_updates = ["message", "edited_message"]
 
@@ -2710,7 +2256,6 @@ async def main() -> None:
                 await discord_bridge.close()
             if healthcheck_runner is not None:
                 await healthcheck_runner.cleanup()
-            await _stop_minecraft_afk_bot()
 
 
 if __name__ == "__main__":
