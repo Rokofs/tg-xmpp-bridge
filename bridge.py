@@ -1080,6 +1080,11 @@ class XMPPBridge(slixmpp.ClientXMPP):
         if msg["type"] not in ("chat", "normal", "groupchat"):
             return
         if XMPP_IS_MUC and str(msg["mucnick"]) == XMPP_MUC_NICK:
+            # ВРЕМЕННАЯ ДИАГНОСТИКА: подтверждаем, что сервер реально
+            # отразил обратно нашу reaction-стензу (как раньше делали
+            # для retraction).
+            if msg["reactions"]["id"]:
+                logger.info("ДИАГНОСТИКА: сервер отразил обратно нашу reaction-стензу:\n%s", str(msg))
             self._learn_own_stanza_id(msg)
             return
         if not self._is_from_peer(msg):
@@ -1382,9 +1387,34 @@ class XMPPBridge(slixmpp.ClientXMPP):
         return stanza["id"]
 
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
-        # send_reactions в этой версии slixmpp синхронный (как и
-        # send_retraction) — сам вызывает send() внутри, awaitить не нужно.
-        self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
+        """Собираем стензу вручную (не через self["xep_0444"].send_reactions),
+        чтобы точно проставить <store/> (XEP-0334) — это официальная
+        ЗАВИСИМОСТЬ самого XEP-0444, и у сообщения с одними реакциями нет
+        <body>, а мы уже знаем (по опыту с retraction), что сервер xmpp.jp
+        не ретранслирует в комнату сообщения без body и без этой
+        подсказки."""
+        from xml.etree import ElementTree as ET
+
+        mtype = "groupchat" if XMPP_IS_MUC else "chat"
+        stanza = self.make_message(mto=XMPP_PEER_JID, mtype=mtype)
+
+        reactions_el = ET.Element("{urn:xmpp:reactions:0}reactions")
+        reactions_el.set("id", target_stanza_id)
+        for emoji in emojis:
+            reaction_el = ET.SubElement(reactions_el, "{urn:xmpp:reactions:0}reaction")
+            reaction_el.text = emoji
+        stanza.append(reactions_el)
+
+        store_el = ET.Element("{urn:xmpp:hints}store")
+        stanza.append(store_el)
+
+        # ВРЕМЕННАЯ ДИАГНОСТИКА: проверяем реальный исходящий XML.
+        try:
+            logger.info("ДИАГНОСТИКА: отправляю reaction-стензу:\n%s", str(stanza))
+        except Exception:
+            pass
+
+        stanza.send()
 
     async def send_retraction_reliable(self, target_stanza_id: str) -> None:
         """Настоящее удаление сообщений (не правок) — реализовано через тот
