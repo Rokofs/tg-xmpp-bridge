@@ -1247,35 +1247,28 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
     async def send_retraction(self, target_stanza_id: str, attempts: int = 3, delay: float = 2.0) -> None:
         """Отправляет удаление (retraction, XEP-0424) ранее отправленного
-        сообщения.
+        сообщения. Собрано вручную (не через self["xep_0424"].send_retraction)
+        и сверено построчно с официальным примером из самой спецификации
+        (https://xmpp.org/extensions/xep-0424.html, раздел "Use Case") —
+        порядок элементов, текст fallback-body (конвенция /me, XEP-0245) и
+        атрибут for="urn:xmpp:message-retract:1" у <fallback> (обязателен
+        по XEP-0428) сделаны так же, как в эталонном примере.
+        Совпадает с тем, как это делает converse.js (сверено с их тестами).
 
-        Собираем стензу ВРУЧНУЮ (не через self["xep_0424"].send_retraction),
-        потому что встроенный метод slixmpp не проставляет атрибут
-        for="urn:xmpp:message-retract:1" у <fallback> — сверка с эталонными
-        тестами converse.js показала, что по спецификации (XEP-0428) он
-        обязателен: именно им клиент должен связывать текст-заглушку
-        именно с retract-действием. Возможно, из-за отсутствия этого
-        атрибута строгие клиенты (похоже, включая Monocles) не считывают
-        связь между <fallback> и <retract> как единое действие.
-
-        include_fallback (текст-заглушка) оставляем — проверено, что
-        сервер xmpp.jp не ретранслирует в комнату сообщения совсем без
-        <body>, то есть без текста удаление вообще не доходит дальше
-        сервера.
-
-        Отправляет НЕСКОЛЬКО раз с паузой: на практике одиночная попытка
+        Отправляет НЕСКОЛЬКО раз с паузой — на практике одиночная попытка
         не всегда доходит с первого раза. Ограниченное число попыток —
         не бесконечный повтор.
         """
         from xml.etree import ElementTree as ET
 
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
-        fallback_text = (
-            "This person attempted to retract a previous message, "
-            "but your client does not support it."
-        )
+        # Текст-заглушка нарочно общий, без содержимого удаляемого
+        # сообщения (спецификация прямо требует этого в разделе Security
+        # Considerations) — ровно текст из официального примера.
+        fallback_text = "/me retracted a previous message, but it's unsupported by your client."
+
         for i in range(attempts):
-            stanza = self.make_message(mto=XMPP_PEER_JID, mbody=fallback_text, mtype=mtype)
+            stanza = self.make_message(mto=XMPP_PEER_JID, mtype=mtype)
 
             retract_el = ET.Element("{urn:xmpp:message-retract:1}retract")
             retract_el.set("id", target_stanza_id)
@@ -1285,16 +1278,10 @@ class XMPPBridge(slixmpp.ClientXMPP):
             fallback_el.set("for", "urn:xmpp:message-retract:1")
             stanza.append(fallback_el)
 
+            stanza["body"] = fallback_text
+
             store_el = ET.Element("{urn:xmpp:hints}store")
             stanza.append(store_el)
-
-            if i == 0:
-                # ВРЕМЕННАЯ ДИАГНОСТИКА: подтверждаем, что атрибут for=
-                # у <fallback> теперь реально присутствует в исходящей стензе.
-                try:
-                    logger.info("ДИАГНОСТИКА: retraction-стенза (ручная сборка):\n%s", str(stanza))
-                except Exception:
-                    pass
 
             stanza.send()
             if i < attempts - 1:
