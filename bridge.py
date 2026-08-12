@@ -376,11 +376,13 @@ async def _propagate_deletion(record: dict, skip: str) -> None:
 
     if skip != "xmpp" and xmpp_bridge and record.get("xmpp"):
         try:
-            # Чистый retraction (XEP-0424) без текстовой заглушки — клиенты
-            # с поддержкой удалят сообщение молча. Раньше здесь была правка
-            # на текст "[сообщение удалено]", но она оставляла в чате
-            # видимый мусор вместо реального исчезновения сообщения.
-            await xmpp_bridge.send_retraction(record["xmpp"])
+            # send_retraction_reliable, а не просто send_retraction —
+            # выяснили на практике, что одиночная retraction не всегда
+            # надёжно отображается в Monocles, а вот связка
+            # retraction+сообщение-с-replace на тот же id удаляет
+            # надёжно (Monocles сама отбрасывает такое сообщение целиком,
+            # что нас в случае настоящего удаления полностью устраивает).
+            await xmpp_bridge.send_retraction_reliable(record["xmpp"])
         except Exception:
             logger.exception("Не удалось отправить удаление в XMPP")
 
@@ -1259,19 +1261,16 @@ class XMPPBridge(slixmpp.ClientXMPP):
         return await self._send_and_confirm(stanza)
 
     async def send_correction(self, new_text: str, original_stanza_id: str) -> Optional[str]:
-        """Отправляет исправление. Многие клиенты (похоже, включая Monocles
-        Chat) не понимают XEP-0308 и по спецификации обязаны показать
-        стензу с <replace> просто как обычное новое сообщение — отсюда
-        видимые "дубликаты". Раз retraction (XEP-0424) у нас уже точно
-        работает и что-то показывает — сначала удаляем старое сообщение,
-        затем шлём новое с текстом (оно всё равно содержит <replace> —
-        клиенты, которые его понимают, всё равно отредактируют на месте,
-        не заметив предшествующий retract).
+        """Отправляет исправление.
 
-        Новое сообщение ЗАОДНО отправляется как reply (XEP-0461) на
-        оригинал — так, даже если клиент показывает его как отдельное
-        сообщение, видно, что это ответ/продолжение того самого, а не
-        случайное новое (меньше путаницы для читающих).
+        ВАЖНОЕ НАБЛЮДЕНИЕ (проверено на практике): если retraction
+        (XEP-0424) отработала, а следом шлём новое сообщение с
+        <replace id="уже_удалённый_id">, Monocles Chat молча ОТБРАСЫВАЕТ
+        его целиком — видимо, интерпретирует как "правка к несуществующему
+        сообщению" и не показывает вообще. Поэтому правку теперь делаем
+        так: удаляем старое сообщение, затем шлём новое ОБЫЧНЫМ
+        сообщением, БЕЗ <replace> — тогда Monocles не пытается его с чем-то
+        связывать и просто показывает как есть.
 
         Возвращает id новой стензы — вызывающий код должен обновить им
         связку, т.к. старый id теперь "мёртв" (сообщение удалено)."""
@@ -1299,12 +1298,34 @@ class XMPPBridge(slixmpp.ClientXMPP):
                     break
 
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=mbody, mtype=mtype)
-        stanza["replace"]["id"] = original_stanza_id
         stanza.send()
         return stanza["id"]
 
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
         await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
+
+    async def send_retraction_reliable(self, target_stanza_id: str) -> None:
+        """Для НАСТОЯЩЕГО удаления сообщений (не правок). Обычная одиночная
+        retraction (см. send_retraction) на практике не всегда надёжно
+        отображается в Monocles. Но обнаружено (см. send_correction): если
+        сразу после retraction отправить ЕЩЁ одно сообщение с
+        <replace id="тот_же_id">, старое сообщение исчезает НАДЁЖНО —
+        похоже, само появление правки с replace на только что удалённый id
+        заставляет клиент точно обработать удаление. Само новое сообщение
+        при этом Monocles отбрасывает (не показывает) — что нас в случае
+        удаления полностью устраивает: ничего показывать и не нужно."""
+        mtype = "groupchat" if XMPP_IS_MUC else "chat"
+        try:
+            await self.send_retraction(target_stanza_id, attempts=2, delay=1.0)
+        except Exception:
+            logger.exception("Не удалось отправить retraction при удалении в XMPP")
+        stanza = self.make_message(
+            mto=XMPP_PEER_JID,
+            mbody="/me retracted a previous message, but it's unsupported by your client.",
+            mtype=mtype,
+        )
+        stanza["replace"]["id"] = target_stanza_id
+        stanza.send()
 
     async def send_retraction(self, target_stanza_id: str, attempts: int = 3, delay: float = 2.0) -> None:
         """Отправляет удаление (retraction, XEP-0424) ранее отправленного
@@ -1416,24 +1437,20 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
     async def send_file(
         self, filepath: Path, caption: str = "", reply_to: Optional[str] = None,
-        reply_to_jid: Optional[str] = None, source_url: Optional[str] = None,
+        reply_to_jid: Optional[str] = None,
     ) -> Optional[str]:
         """Загружает файл на XMPP-сервер (XEP-0363) и отправляет ссылку с OOB.
-
-        source_url — исходная ссылка на файл (например, прямая ссылка
-        Telegram), на случай, если загрузка на XMPP-сервер вообще не
-        удастся. Тогда вместо текста ошибки просто пришлём эту ссылку —
-        не так красиво, как вложение, но хотя бы кликабельно и без
-        служебного текста про ошибку.
 
         Возвращает id отправленной станзы (для правок/реакций/reply),
         либо None, если файл вообще не удалось отправить.
         """
 
         async def _fallback_link_or_error(error_note: str) -> Optional[str]:
-            if source_url:
-                text = f"{caption}\n{source_url}".strip() if caption else source_url
-                return await self.send_text(text)
+            # Раньше здесь можно было прислать прямую ссылку на исходный
+            # файл (например, из Telegram) вместо текста ошибки — но
+            # такая ссылка содержит токен бота в открытом виде, а канал
+            # групповой — решили не рисковать безопасностью токена ради
+            # красивого фолбэка.
             return await self.send_text(f"{caption} {error_note}".strip())
 
         try:
@@ -2045,7 +2062,6 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 xmpp_id = await xmpp_bridge.send_file(
                     local_path, caption=caption_xmpp,
                     reply_to=reply_targets.get("xmpp"), reply_to_jid=reply_targets.get("xmpp_to"),
-                    source_url=file_obj.file_path,
                 )
                 if xmpp_id:
                     _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
