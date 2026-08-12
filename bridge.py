@@ -1305,20 +1305,19 @@ class XMPPBridge(slixmpp.ClientXMPP):
         await self["xep_0444"].send_reactions(JID(XMPP_PEER_JID), target_stanza_id, emojis)
 
     async def send_retraction_reliable(self, target_stanza_id: str) -> None:
-        """Для НАСТОЯЩЕГО удаления сообщений (не правок). Обычная одиночная
-        retraction (см. send_retraction) на практике не всегда надёжно
-        отображается в Monocles. Но обнаружено (см. send_correction): если
-        сразу после retraction отправить ЕЩЁ одно сообщение с
-        <replace id="тот_же_id">, старое сообщение исчезает НАДЁЖНО —
-        похоже, само появление правки с replace на только что удалённый id
-        заставляет клиент точно обработать удаление. Само новое сообщение
-        при этом Monocles отбрасывает (не показывает) — что нас в случае
-        удаления полностью устраивает: ничего показывать и не нужно."""
+        """Настоящее удаление сообщений (не правок) — реализовано через тот
+        же механизм, что и правки (send_correction), только БЕЗ отдельного
+        retraction и без повторной отправки текста.
+
+        Обнаружено на практике: сообщение с <replace id="X"> на уже
+        отправленный id Monocles воспринимает как правку — но поскольку
+        мы не посылаем никакого "настоящего" нового текста отдельно,
+        а только саму правку, старое сообщение просто ПОЛНОСТЬЮ ПРОПАДАЕТ
+        (не отображается вообще ни в каком виде). Для правок (см.
+        send_correction) мы, наоборот, ПОСЛЕ этого шлём ещё и обычное
+        сообщение с текстом — тут этого делать не нужно, раз цель именно
+        удаление, а не показ нового текста."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
-        try:
-            await self.send_retraction(target_stanza_id, attempts=2, delay=1.0)
-        except Exception:
-            logger.exception("Не удалось отправить retraction при удалении в XMPP")
         stanza = self.make_message(
             mto=XMPP_PEER_JID,
             mbody="/me retracted a previous message, but it's unsupported by your client.",
