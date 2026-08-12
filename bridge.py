@@ -153,6 +153,7 @@ except ImportError:
 from telegram import ReactionTypeEmoji, Update
 from telegram.error import BadRequest
 from telegram.ext import (
+    AIORateLimiter,
     Application,
     CommandHandler,
     ContextTypes,
@@ -2325,15 +2326,23 @@ async def _start_healthcheck_server():
 # мост (не более TELEGRAM_DELETE_CHECK_BATCH штук за раз, реже одного
 # раза в TELEGRAM_DELETE_CHECK_INTERVAL секунд — чтобы не долбить API).
 #
+# ВАЖНО: теперь, когда есть MTProto-userbot (см. TELEGRAM_USERBOT_ENABLED)
+# для мгновенного обнаружения удалений, эта проверка через Bot API стала
+# просто медленной подстраховкой на случай, если MTProto-сессия
+# отключится — поэтому специально сделана НЕАГРЕССИВНОЙ, чтобы не
+# отъедать лимит запросов у обычной пересылки сообщений (см. flood
+# control — раньше слишком частая/большая проверка реально роняла
+# доставку обычных сообщений).
+#
 # Чтобы отключить — удалите/закомментируйте вызов
 # asyncio.create_task(_tg_check_deletions_loop()) в main().
 
-TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "10"))
-TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "500"))
+TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "60"))
+TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "200"))
 # Пауза между отдельными проверками внутри одного прохода — весь проход
-# должен укладываться в несколько секунд, чтобы не съедать весь
-# интервал между проходами.
-TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "0.03"))
+# должен укладываться в разумное время, не съедая весь интервал между
+# проходами и не отбирая лимит запросов у обычной пересылки сообщений.
+TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "0.3"))
 
 # id технических пересылок-проверок (см. "message can't be edited" ниже) —
 # чтобы обычный обработчик сообщений не переслал их дальше как настоящие.
@@ -2569,7 +2578,7 @@ async def main() -> None:
     healthcheck_runner = await _start_healthcheck_server()
     await _start_telegram_userbot()
 
-    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN).rate_limiter(AIORateLimiter(max_retries=3))
 
     if TELEGRAM_FORCE_IPV4:
         import httpx
