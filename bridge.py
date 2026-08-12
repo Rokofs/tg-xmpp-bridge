@@ -540,15 +540,32 @@ def _parse_manual_quote(body: str):
 
 
 def _strip_manual_quote_for_telegram(text: str) -> str:
-    """Убирает "сырые" ручные цитаты (строки, начинающиеся с '> ') из
-    текста перед отправкой в Telegram — там уже работает настоящий
-    reply_to_message_id, а вложенный текст цитаты только захламляет
-    сообщение (особенно после нескольких "прыжков" через сторонних
-    ботов вроде matrixt2bot/ChatResender, у каждого из которых свой
-    формат цитирования текстом)."""
+    """Убирает "сырые" ручные цитаты из текста перед отправкой в Telegram —
+    там уже работает настоящий reply_to_message_id, а вложенный текст
+    цитаты только захламляет сообщение (особенно после нескольких
+    "прыжков" через сторонних ботов вроде matrixt2bot/ChatResender, у
+    каждого из которых свой формат цитирования текстом).
+
+    В отличие от _parse_manual_quote (который используется для XMPP и
+    намеренно НЕ трогает вложенные ">>"-цитаты, чтобы не потерять
+    настоящий текст при сопоставлении reply) — тут чистим агрессивно:
+    убираем ЛЮБые строки, начинающиеся с одного или нескольких ">",
+    независимо от вложенности. Для Telegram нам не нужно ничего из
+    этого сохранять — там и так есть нормальный reply."""
     if not text:
         return text
-    _quoted, remaining = _parse_manual_quote(text)
+    lines = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith(">"):
+            continue
+        # Строка, целиком состоящая из голой ссылки — почти всегда
+        # дублирующая ссылка на уже прикреплённый/процитированный файл
+        # (Monocles вставляет такие ссылки текстом внутри цитат).
+        if re.fullmatch(r"https?://\S+", line.strip()):
+            continue
+        lines.append(line)
+    remaining = "\n".join(lines).strip()
     return remaining if remaining else text
 
 
@@ -943,6 +960,8 @@ class XMPPBridge(slixmpp.ClientXMPP):
         self._pending_echo_futures: dict = {}
 
         self.register_plugin("xep_0030")  # Service Discovery
+        self.register_plugin("xep_0115")  # Entity Capabilities — ОБЯЗАТЕЛЕН по спеке XEP-0444
+        # для того, чтобы другие клиенты доверяли нашей поддержке реакций
         self.register_plugin("xep_0128")  # Service Discovery Extensions — зависимость xep_0363
         self.register_plugin("xep_0199")  # XMPP Ping — держит соединение живым
         self.register_plugin("xep_0066")  # Out of Band Data — ссылки на файлы
