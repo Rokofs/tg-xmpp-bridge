@@ -1249,24 +1249,54 @@ class XMPPBridge(slixmpp.ClientXMPP):
         """Отправляет удаление (retraction, XEP-0424) ранее отправленного
         сообщения.
 
-        include_fallback=True (с текстом-заглушкой) — сознательное решение:
-        проверено, что сервер xmpp.jp НЕ ретранслирует в комнату сообщения
-        совсем без <body>, то есть без текста удаление вообще не доходит
-        дальше сервера. С текстом хотя бы доходит до всех участников —
-        Monocles его пока не понимает и просто покажет текст заглушки как
-        обычное сообщение (известное ограничение конкретно этого клиента,
-        см. README), но другие XEP-0424-совместимые клиенты в комнате
-        корректно скроют исходное сообщение.
+        Собираем стензу ВРУЧНУЮ (не через self["xep_0424"].send_retraction),
+        потому что встроенный метод slixmpp не проставляет атрибут
+        for="urn:xmpp:message-retract:1" у <fallback> — сверка с эталонными
+        тестами converse.js показала, что по спецификации (XEP-0428) он
+        обязателен: именно им клиент должен связывать текст-заглушку
+        именно с retract-действием. Возможно, из-за отсутствия этого
+        атрибута строгие клиенты (похоже, включая Monocles) не считывают
+        связь между <fallback> и <retract> как единое действие.
+
+        include_fallback (текст-заглушка) оставляем — проверено, что
+        сервер xmpp.jp не ретранслирует в комнату сообщения совсем без
+        <body>, то есть без текста удаление вообще не доходит дальше
+        сервера.
 
         Отправляет НЕСКОЛЬКО раз с паузой: на практике одиночная попытка
         не всегда доходит с первого раза. Ограниченное число попыток —
         не бесконечный повтор.
-        send_retraction в slixmpp синхронный (сам вызывает send())."""
+        """
+        from xml.etree import ElementTree as ET
+
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
+        fallback_text = (
+            "This person attempted to retract a previous message, "
+            "but your client does not support it."
+        )
         for i in range(attempts):
-            self["xep_0424"].send_retraction(
-                JID(XMPP_PEER_JID), target_stanza_id, mtype=mtype, include_fallback=True
-            )
+            stanza = self.make_message(mto=XMPP_PEER_JID, mbody=fallback_text, mtype=mtype)
+
+            retract_el = ET.Element("{urn:xmpp:message-retract:1}retract")
+            retract_el.set("id", target_stanza_id)
+            stanza.append(retract_el)
+
+            fallback_el = ET.Element("{urn:xmpp:fallback:0}fallback")
+            fallback_el.set("for", "urn:xmpp:message-retract:1")
+            stanza.append(fallback_el)
+
+            store_el = ET.Element("{urn:xmpp:hints}store")
+            stanza.append(store_el)
+
+            if i == 0:
+                # ВРЕМЕННАЯ ДИАГНОСТИКА: подтверждаем, что атрибут for=
+                # у <fallback> теперь реально присутствует в исходящей стензе.
+                try:
+                    logger.info("ДИАГНОСТИКА: retraction-стенза (ручная сборка):\n%s", str(stanza))
+                except Exception:
+                    pass
+
+            stanza.send()
             if i < attempts - 1:
                 await asyncio.sleep(delay)
 
