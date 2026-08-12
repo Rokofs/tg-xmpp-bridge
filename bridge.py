@@ -389,6 +389,14 @@ async def _propagate_deletion(record: dict, skip: str) -> None:
     if skip != "tg" and telegram_app and record.get("tg"):
         try:
             await telegram_app.bot.delete_message(chat_id=TELEGRAM_CHAT_ID, message_id=record["tg"])
+        except BadRequest as e:
+            if "message to delete not found" in str(e).lower():
+                # Уже удалено (например, другой путь обнаружения удаления
+                # сработал параллельно чуть раньше) — не ошибка, просто
+                # гонка, ничего страшного.
+                pass
+            else:
+                logger.exception("Не удалось удалить сообщение в Telegram")
         except Exception:
             logger.exception("Не удалось удалить сообщение в Telegram")
 
@@ -927,6 +935,23 @@ class XMPPBridge(slixmpp.ClientXMPP):
             real_id = stanza_id_el["id"] or None
 
         resolved_id = real_id if (real_id and real_id != client_id) else client_id
+
+        # ВРЕМЕННАЯ ДИАГНОСТИКА: печатаем occupant-id этого эха — сравниваем
+        # occupant-id обычных сообщений с occupant-id retraction-сообщений,
+        # проверяем гипотезу про спецификацию (XEP-0424 требует совпадения
+        # occupant-id между исходным сообщением и retraction в полу-
+        # анонимных MUC). Ищем прямо в сыром XML — не зависит от того,
+        # зарегистрирован ли у нас плагин xep_0421.
+        try:
+            occupant_el = msg.xml.find("{urn:xmpp:occupant-id:0}occupant-id")
+            occupant_id = occupant_el.get("id") if occupant_el is not None else None
+            is_retraction = msg.xml.find("{urn:xmpp:message-retract:1}retract") is not None
+            logger.info(
+                "ДИАГНОСТИКА: occupant-id нашего эха (retraction=%s, resolved_id=%s): %s",
+                is_retraction, resolved_id, occupant_id,
+            )
+        except Exception:
+            pass
 
         if real_id and real_id != client_id:
             key = _xmpp_lookup.get(client_id)
