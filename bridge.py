@@ -2389,10 +2389,25 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"{author}: [файл не переслан — превышает лимит Telegram Bot API "
                 f"в {TELEGRAM_BOT_API_FILE_LIMIT_MB} МБ на скачивание ботом]"
             )
+            # Раньше для этого уведомления не создавалась связка сообщений
+            # вовсе — из-за этого нельзя было ни отреагировать, ни ответить
+            # ни на исходное сообщение в Telegram, ни на само уведомление
+            # на других площадках. Теперь создаём как обычно.
+            key = _new_bridge_record(tg=msg.message_id)
             if xmpp_bridge:
-                await xmpp_bridge.send_text(notice)
+                try:
+                    xmpp_id = await xmpp_bridge.send_text(notice)
+                    if xmpp_id:
+                        _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
+                except Exception:
+                    logger.exception("Не удалось переслать уведомление о превышении лимита в XMPP")
             if discord_bridge:
-                await discord_bridge.send_text(notice)
+                try:
+                    discord_id = await discord_bridge.send_text(notice)
+                    if discord_id:
+                        _link_record(key, discord=discord_id)
+                except Exception:
+                    logger.exception("Не удалось переслать уведомление о превышении лимита в Discord")
         else:
             logger.exception("Ошибка Telegram при получении файла")
         return
