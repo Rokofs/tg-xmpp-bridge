@@ -126,6 +126,7 @@ import re
 import shutil
 import tempfile
 import time
+import uuid
 from html import escape as _html_escape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -263,8 +264,14 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 # храним, под каким id оно было отправлено на каждой из площадок —
 # это нужно, чтобы потом найти, ЧТО поправить/на чём поставить
 # реакцию, когда придёт событие с любой стороны.
+#
+# ВАЖНО: ключи — настоящие UUID, а не последовательный счётчик. Счётчик,
+# начинающий с 1 при каждом перезапуске, при подключённой базе данных
+# (DATABASE_URL) сталкивался бы с ключами старых записей, загруженных из
+# базы (у них тоже маленькие номера из прошлой сессии) — реакция/ответ
+# по такому "переиспользованному" ключу мог попасть на совершенно
+# другое, чужое сообщение.
 
-_bridge_key_counter = itertools.count(1)
 _bridge_records: dict = {}   # key -> {"tg": int|None, "xmpp": str|None, "discord": int|None, "ts": float}
 _tg_lookup: dict = {}        # tg_message_id -> key
 _xmpp_lookup: dict = {}      # xmpp_stanza_id -> key
@@ -453,7 +460,7 @@ async def _db_save_recent_text_impl(key: str, text: str, ts: float) -> None:
 
 
 def _new_bridge_record(**ids) -> str:
-    key = str(next(_bridge_key_counter))
+    key = uuid.uuid4().hex
     record = {"tg": None, "xmpp": None, "discord": None, "xmpp_to": None, "ts": time.time()}
     record.update({k: v for k, v in ids.items() if v is not None})
     _bridge_records[key] = record
