@@ -223,14 +223,24 @@ DB_ENABLED = bool(DATABASE_URL)
 # получить исправление на других площадках.
 EDIT_WINDOW_SECONDS = int(os.environ.get("EDIT_WINDOW_SECONDS", "300"))
 
-# Как долго вообще помнить связку сообщений между площадками (нужно
-# для того, чтобы реакции и reply могли долетать и позже, чем
-# EDIT_WINDOW_SECONDS после отправки). По умолчанию 24 часа — раньше
-# было 6, но этого не хватало для reply на сообщения, отправленные
-# накануне. ВАЖНО: связка хранится только в памяти процесса и
-# сбрасывается при каждом перезапуске бота — большой TTL не поможет,
-# если бот часто перезапускается/передеплоится.
-MESSAGE_MAP_TTL_SECONDS = int(os.environ.get("MESSAGE_MAP_TTL_SECONDS", str(24 * 3600)))
+# Как долго вообще помнить связку сообщений между площадками (нужно для
+# того, чтобы реакции и reply могли долетать спустя долгое время после
+# отправки). Раньше это было ограничено 6, потом 24 часами — но это было
+# ДО того, как появилась настоящая база данных (DATABASE_URL). Теперь,
+# когда связка не пропадает при перезапуске, можно позволить себе
+# хранить её действительно долго — по умолчанию 180 дней (полгода).
+# Место в базе это почти не расходует (каждая запись — пара id, десятки-
+# сотни байт), так что можно смело ставить и больше через переменную
+# окружения. Если DATABASE_URL НЕ задан (работа только в памяти) —
+# большой TTL смысла не имеет, всё равно обнулится при следующем
+# перезапуске/передеплое.
+MESSAGE_MAP_TTL_SECONDS = int(os.environ.get("MESSAGE_MAP_TTL_SECONDS", str(180 * 24 * 3600)))
+
+# Сколько последних XMPP-сообщений держать для эвристики "угадывания"
+# reply по тексту цитаты (для клиентов вроде Monocles, которые не шлют
+# структурированный <reply>, а вставляют "> текст" вручную). Раньше было
+# 200 — подняли, раз теперь есть настоящая база и место не проблема.
+RECENT_XMPP_TEXTS_LIMIT = int(os.environ.get("RECENT_XMPP_TEXTS_LIMIT", "2000"))
 
 TELEGRAM_BOT_API_FILE_LIMIT_MB = 20  # ограничение самого Telegram, не скрипта
 
@@ -364,7 +374,8 @@ async def _load_from_db() -> None:
                 loaded += 1
 
             text_rows = await conn.fetch(
-                "SELECT key, body, ts FROM recent_xmpp_texts ORDER BY ts DESC LIMIT 200"
+                "SELECT key, body, ts FROM recent_xmpp_texts ORDER BY ts DESC LIMIT $1",
+                RECENT_XMPP_TEXTS_LIMIT,
             )
             for row in reversed(text_rows):
                 _recent_xmpp_texts.append((row["key"], row["body"], row["ts"]))
@@ -428,13 +439,14 @@ async def _db_save_recent_text_impl(key: str, text: str, ts: float) -> None:
                 "INSERT INTO recent_xmpp_texts (key, body, ts) VALUES ($1, $2, $3)",
                 key, text, ts,
             )
-            # Не даём таблице расти бесконечно — оставляем только последние 200.
+            # Не даём таблице расти бесконечно — оставляем только последние RECENT_XMPP_TEXTS_LIMIT.
             await conn.execute(
                 """
                 DELETE FROM recent_xmpp_texts WHERE id NOT IN (
-                    SELECT id FROM recent_xmpp_texts ORDER BY ts DESC LIMIT 200
+                    SELECT id FROM recent_xmpp_texts ORDER BY ts DESC LIMIT $1
                 )
-                """
+                """,
+                RECENT_XMPP_TEXTS_LIMIT,
             )
     except Exception:
         logger.exception("Не удалось сохранить текст для цитаты в базу данных")
@@ -644,8 +656,8 @@ def _remember_xmpp_text(key: str, text: str) -> None:
         return
     ts = time.time()
     _recent_xmpp_texts.append((key, text, ts))
-    if len(_recent_xmpp_texts) > 200:
-        del _recent_xmpp_texts[: len(_recent_xmpp_texts) - 200]
+    if len(_recent_xmpp_texts) > RECENT_XMPP_TEXTS_LIMIT:
+        del _recent_xmpp_texts[: len(_recent_xmpp_texts) - RECENT_XMPP_TEXTS_LIMIT]
     _db_save_recent_text(key, text, ts)
 
 
