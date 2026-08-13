@@ -5,3 +5,4 @@ Pillow>=10.0
 aiohttp>=3.9
 discord.py>=2.4
 telethon>=1.36
+asyncpg>=0.29

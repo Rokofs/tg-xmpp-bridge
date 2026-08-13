@@ -208,14 +208,29 @@ TELEGRAM_USERBOT_SESSION = os.environ.get("TELEGRAM_USERBOT_SESSION", "").strip(
 TELEGRAM_USERBOT_ENABLED = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_USERBOT_SESSION)
 # ============================================================================
 
+# ============================================================================
+# БАЗА ДАННЫХ (PostgreSQL, например Neon) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
+# Без неё связка сообщений между площадками (для reply/реакций/правок)
+# живёт только в памяти процесса и обнуляется при каждом перезапуске.
+# С базой — переживает перезапуски, ограничена только MESSAGE_MAP_TTL_SECONDS.
+# Чтобы отключить — не задавайте DATABASE_URL (бот тогда работает как раньше,
+# только в памяти).
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip() or None
+DB_ENABLED = bool(DATABASE_URL)
+# ============================================================================
+
 # Сколько секунд после отправки сообщение можно ещё отредактировать и
 # получить исправление на других площадках.
 EDIT_WINDOW_SECONDS = int(os.environ.get("EDIT_WINDOW_SECONDS", "300"))
 
 # Как долго вообще помнить связку сообщений между площадками (нужно
-# для того, чтобы реакции могли долетать и позже, чем EDIT_WINDOW_SECONDS
-# после отправки). По умолчанию 6 часов.
-MESSAGE_MAP_TTL_SECONDS = int(os.environ.get("MESSAGE_MAP_TTL_SECONDS", str(6 * 3600)))
+# для того, чтобы реакции и reply могли долетать и позже, чем
+# EDIT_WINDOW_SECONDS после отправки). По умолчанию 24 часа — раньше
+# было 6, но этого не хватало для reply на сообщения, отправленные
+# накануне. ВАЖНО: связка хранится только в памяти процесса и
+# сбрасывается при каждом перезапуске бота — большой TTL не поможет,
+# если бот часто перезапускается/передеплоится.
+MESSAGE_MAP_TTL_SECONDS = int(os.environ.get("MESSAGE_MAP_TTL_SECONDS", str(24 * 3600)))
 
 TELEGRAM_BOT_API_FILE_LIMIT_MB = 20  # ограничение самого Telegram, не скрипта
 
@@ -278,12 +293,160 @@ def _own_xmpp_reply_jid() -> str:
     return XMPP_PEER_JID
 
 
+_db_pool = None  # type: Optional["asyncpg.Pool"]
+
+
+async def _init_db() -> None:
+    """Подключается к базе (если задан DATABASE_URL) и создаёт таблицы,
+    если их ещё нет. При любой ошибке просто отключает работу с базой —
+    бот продолжит работать как раньше, только в памяти."""
+    global _db_pool
+    if not DB_ENABLED:
+        return
+    try:
+        import asyncpg
+    except ImportError:
+        logger.error(
+            "DATABASE_URL задан, но asyncpg не установлен (pip install asyncpg) — "
+            "связка сообщений будет жить только в памяти"
+        )
+        return
+    try:
+        _db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+        async with _db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bridge_records (
+                    key TEXT PRIMARY KEY,
+                    tg BIGINT,
+                    xmpp TEXT,
+                    discord BIGINT,
+                    xmpp_to TEXT,
+                    ts DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recent_xmpp_texts (
+                    id SERIAL PRIMARY KEY,
+                    key TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    ts DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+        logger.info("База данных подключена — связка сообщений теперь переживёт перезапуск бота")
+    except Exception:
+        logger.exception("Не удалось подключиться к базе данных — работаю только в памяти (как раньше)")
+        _db_pool = None
+
+
+async def _load_from_db() -> None:
+    """Вызывается один раз при старте — подгружает в память всё, что ещё
+    не устарело (в рамках MESSAGE_MAP_TTL_SECONDS)."""
+    if _db_pool is None:
+        return
+    try:
+        now = time.time()
+        async with _db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key, tg, xmpp, discord, xmpp_to, ts FROM bridge_records")
+            loaded = 0
+            for row in rows:
+                if now - row["ts"] > MESSAGE_MAP_TTL_SECONDS:
+                    continue
+                record = {
+                    "tg": row["tg"], "xmpp": row["xmpp"], "discord": row["discord"],
+                    "xmpp_to": row["xmpp_to"], "ts": row["ts"],
+                }
+                _bridge_records[row["key"]] = record
+                _link_lookup(row["key"], record)
+                loaded += 1
+
+            text_rows = await conn.fetch(
+                "SELECT key, body, ts FROM recent_xmpp_texts ORDER BY ts DESC LIMIT 200"
+            )
+            for row in reversed(text_rows):
+                _recent_xmpp_texts.append((row["key"], row["body"], row["ts"]))
+        logger.info(
+            "Загружено из базы: %s связок сообщений, %s недавних текстов для цитат",
+            loaded, len(text_rows),
+        )
+    except Exception:
+        logger.exception("Не удалось загрузить связку сообщений из базы данных")
+
+
+def _db_save_record(key: str, record: dict) -> None:
+    """Запись в базу — асинхронно, не блокируя основной поток обработки."""
+    if _db_pool is None:
+        return
+    asyncio.create_task(_db_save_record_impl(key, record))
+
+
+async def _db_save_record_impl(key: str, record: dict) -> None:
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO bridge_records (key, tg, xmpp, discord, xmpp_to, ts)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (key) DO UPDATE SET
+                    tg = EXCLUDED.tg, xmpp = EXCLUDED.xmpp, discord = EXCLUDED.discord,
+                    xmpp_to = EXCLUDED.xmpp_to, ts = EXCLUDED.ts
+                """,
+                key, record.get("tg"), record.get("xmpp"), record.get("discord"),
+                record.get("xmpp_to"), record["ts"],
+            )
+    except Exception:
+        logger.exception("Не удалось сохранить связку сообщения в базу данных")
+
+
+def _db_delete_record(key: str) -> None:
+    if _db_pool is None:
+        return
+    asyncio.create_task(_db_delete_record_impl(key))
+
+
+async def _db_delete_record_impl(key: str) -> None:
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM bridge_records WHERE key = $1", key)
+    except Exception:
+        logger.exception("Не удалось удалить связку сообщения из базы данных")
+
+
+def _db_save_recent_text(key: str, text: str, ts: float) -> None:
+    if _db_pool is None:
+        return
+    asyncio.create_task(_db_save_recent_text_impl(key, text, ts))
+
+
+async def _db_save_recent_text_impl(key: str, text: str, ts: float) -> None:
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO recent_xmpp_texts (key, body, ts) VALUES ($1, $2, $3)",
+                key, text, ts,
+            )
+            # Не даём таблице расти бесконечно — оставляем только последние 200.
+            await conn.execute(
+                """
+                DELETE FROM recent_xmpp_texts WHERE id NOT IN (
+                    SELECT id FROM recent_xmpp_texts ORDER BY ts DESC LIMIT 200
+                )
+                """
+            )
+    except Exception:
+        logger.exception("Не удалось сохранить текст для цитаты в базу данных")
+
+
 def _new_bridge_record(**ids) -> str:
     key = str(next(_bridge_key_counter))
-    record = {"tg": None, "xmpp": None, "discord": None, "xmpp_to": None, "ts": time.monotonic()}
+    record = {"tg": None, "xmpp": None, "discord": None, "xmpp_to": None, "ts": time.time()}
     record.update({k: v for k, v in ids.items() if v is not None})
     _bridge_records[key] = record
     _link_lookup(key, record)
+    _db_save_record(key, record)
     return key
 
 
@@ -295,6 +458,7 @@ def _link_record(key: str, **ids) -> None:
         if v is not None:
             record[k] = v
     _link_lookup(key, record)
+    _db_save_record(key, record)
 
 
 def _link_lookup(key: str, record: dict) -> None:
@@ -307,7 +471,7 @@ def _link_lookup(key: str, record: dict) -> None:
 
 
 def _prune_bridge_records() -> None:
-    now = time.monotonic()
+    now = time.time()
     stale = [k for k, v in _bridge_records.items() if now - v["ts"] > MESSAGE_MAP_TTL_SECONDS]
     for k in stale:
         record = _bridge_records.pop(k, None)
@@ -321,6 +485,7 @@ def _prune_bridge_records() -> None:
             _xmpp_lookup.pop(record["xmpp"], None)
         if record.get("discord") is not None:
             _discord_lookup.pop(record["discord"], None)
+        _db_delete_record(k)
 
 
 def _forget_record_by_key(key: Optional[str]) -> None:
@@ -337,6 +502,7 @@ def _forget_record_by_key(key: Optional[str]) -> None:
         _tg_lookup.pop(record["tg"], None)
         _non_editable_tg_messages.discard(record["tg"])
         _last_forward_check.pop(record["tg"], None)
+    _db_delete_record(key)
     if record.get("xmpp") is not None:
         _xmpp_lookup.pop(record["xmpp"], None)
     if record.get("discord") is not None:
@@ -476,9 +642,11 @@ def _remember_xmpp_text(key: str, text: str) -> None:
     text = (text or "").strip()
     if not text:
         return
-    _recent_xmpp_texts.append((key, text, time.monotonic()))
+    ts = time.time()
+    _recent_xmpp_texts.append((key, text, ts))
     if len(_recent_xmpp_texts) > 200:
         del _recent_xmpp_texts[: len(_recent_xmpp_texts) - 200]
+    _db_save_recent_text(key, text, ts)
 
 
 def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
@@ -490,7 +658,7 @@ def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
     # хранит настоящие переносы строк — без нормализации многострочные
     # сообщения никогда не совпадут как подстрока.
     quoted_normalized = " ".join(quoted.split())
-    now = time.monotonic()
+    now = time.time()
     for key, text, ts in reversed(_recent_xmpp_texts):
         if now - ts > MESSAGE_MAP_TTL_SECONDS:
             continue
@@ -1148,7 +1316,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
             _prune_bridge_records()
             key = _xmpp_lookup.get(correction_id)
             record = _bridge_records.get(key) if key else None
-            if not record or time.monotonic() - record["ts"] > EDIT_WINDOW_SECONDS:
+            if not record or time.time() - record["ts"] > EDIT_WINDOW_SECONDS:
                 logger.info(
                     "Исправление XMPP-сообщения %s: оригинал не найден или окно "
                     "редактирования истекло — игнорирую",
@@ -1868,7 +2036,7 @@ class DiscordBridge(_DiscordBase):
         _prune_bridge_records()
         key = _discord_lookup.get(after.id)
         record = _bridge_records.get(key) if key else None
-        if not record or time.monotonic() - record["ts"] > EDIT_WINDOW_SECONDS:
+        if not record or time.time() - record["ts"] > EDIT_WINDOW_SECONDS:
             return
 
         author = _colored_author(f"discord:{after.author.id}", after.author.display_name)
@@ -2261,7 +2429,7 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
     _prune_bridge_records()
     key = _tg_lookup.get(msg.message_id)
     record = _bridge_records.get(key) if key else None
-    if not record or time.monotonic() - record["ts"] > EDIT_WINDOW_SECONDS:
+    if not record or time.time() - record["ts"] > EDIT_WINDOW_SECONDS:
         logger.info(
             "Отредактировано сообщение %s, но оно старше %s сек или не пересылалось — игнорирую",
             msg.message_id, EDIT_WINDOW_SECONDS,
@@ -2596,6 +2764,9 @@ async def _stop_telegram_userbot() -> None:
 async def main() -> None:
     global telegram_app, xmpp_bridge, discord_bridge
 
+    await _init_db()
+    await _load_from_db()
+
     healthcheck_runner = await _start_healthcheck_server()
     await _start_telegram_userbot()
 
@@ -2691,6 +2862,8 @@ async def main() -> None:
             if healthcheck_runner is not None:
                 await healthcheck_runner.cleanup()
             await _stop_telegram_userbot()
+            if _db_pool is not None:
+                await _db_pool.close()
 
 
 if __name__ == "__main__":
