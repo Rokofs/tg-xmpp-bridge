@@ -1,123 +1,3 @@
-"""
-Telegram <-> XMPP <-> Discord мост (bridge)
-=============================================
-
-Трёхсторонний мост: сообщение из любой из трёх площадок (Telegram-чат,
-XMPP-собеседник/комната, Discord-канал) пересылается в две остальные.
-Работает и в "двустороннем" режиме — просто не настраивайте XMPP или
-Discord, и мост будет работать для оставшейся пары.
-
-АРХИТЕКТУРА
------------
-- Telegram: python-telegram-bot (v20+, асинхронный, long polling).
-- XMPP: slixmpp (нативно асинхронный, на asyncio).
-- Discord: discord.py (нативно асинхронный, на asyncio).
-Все три работают в одном asyncio event loop.
-
-ЧТО ПЕРЕСЫЛАЕТСЯ
------------------
-- Текст, фото, видео, гифки, голосовые, аудио, документы, стикеры
-  (статические стикеры конвертируются в PNG).
-- Редактирование текстовых сообщений в течение EDIT_WINDOW_SECONDS
-  после отправки (по умолчанию 5 минут) — через XEP-0308 для XMPP,
-  editMessageText для Telegram, message.edit() для Discord.
-- Реакции на сообщения (👍❤️ и т.д.) между всеми тремя площадками —
-  через XEP-0444 для XMPP, setMessageReaction для Telegram (бот
-  должен быть админом чата, чтобы ПОЛУЧАТЬ реакции от пользователей),
-  message.add_reaction()/remove_reaction() для Discord.
-  ВАЖНО: реакция технически не может "принадлежать" другому
-  пользователю на чужой платформе — бот сам ставит соответствующую
-  реакцию от своего имени на сообщении на других площадках, как
-  визуальное отражение того, что кто-то отреагировал.
-- Настоящие ответы (reply) на сообщения — если ответить на пересланное
-  сообщение на любой площадке, ответ придёт на двух других площадках
-  тоже как настоящий reply (XEP-0461 для XMPP, reply_to_message_id
-  для Telegram, MessageReference для Discord), а не просто текстом с
-  цитатой.
-- Ответ ОДНИМ эмодзи (или несколькими) на пересланное сообщение
-  считается реакцией, а не обычным ответом — удобно, если в клиенте
-  нет отдельной кнопки для реакций (например, в некоторых версиях
-  Monocles Chat поддержка XEP-0444 ограничена).
-- Для групповых XMPP-чатов (MUC) reply/реакции корректно используют
-  stanza-id (XEP-0359), назначенный самой комнатой, а не клиентский id
-  — так, как того требует спецификация. Без этого reply/реакции,
-  присланные из клиентов вроде Monocles Chat, не находили нужное
-  сообщение и пересылались как обычный текст с цитатой.
-
-УСТАНОВКА
----------
-    pip install -r requirements.txt
-
-НАСТРОЙКА
----------
-Все параметры — через переменные окружения (см. .env.example).
-Каждая из площадок (XMPP, Discord) настраивается независимо — мост
-работает и с одной из них, и с обеими сразу.
-
-ОГРАНИЧЕНИЯ ЭТОЙ ВЕРСИИ
-------------------------
-- Мост работает только с ОДНИМ Telegram-чатом, ОДНИМ XMPP-собеседником
-  (или комнатой) и ОДНИМ Discord-каналом одновременно. Для нескольких
-  наборов — запускайте несколько экземпляров с разными переменными.
-- Файлы > 20 МБ Telegram Bot API не отдаёт ботам (ограничение самого
-  Telegram) — при превышении лимита бот пишет об этом текстом.
-- Редактирование (правка текста) поддерживается только для обычного
-  текста — не для подписей к медиа и не для самих файлов. Реакции же
-  теперь работают и на медиа-сообщениях тоже (фото, видео, кружки,
-  голосовые, документы, стикеры).
-- Реакция "от нескольких разных людей одновременно" не агрегируется
-  идеально: если на исходной площадке реагируют несколько человек
-  разными эмодзи, на других площадках отражается только последнее
-  изменение (не сумма всех реакций).
-- Reply на XMPP-сторону детектируется только если клиент отправителя
-  реализует структурированный XEP-0461 (`<reply id="..."/>`). Судя по
-  всему, Monocles Chat пока просто визуально имитирует цитату текстом
-  в теле сообщения, без структурированной пометки. Для этого случая
-  добавлена ЭКСПЕРИМЕНТАЛЬНАЯ эвристика: бот распознаёт вставленную
-  текстом цитату ("> текст\n\nответ") и пытается сопоставить её с
-  недавно отправленными в комнату сообщениями по содержимому текста.
-  Работает не идеально — может ошибиться на очень похожих или совсем
-  коротких сообщениях, и не сработает, если исходный текст сильно
-  обрезан клиентом при цитировании.
-- Ответы (reply) работают, только если исходное сообщение (на которое
-  отвечают) было переслано мостом, то есть связка для него ещё жива
-  в памяти (см. MESSAGE_MAP_TTL_SECONDS ниже). Ответ на что-то более
-  старое или отправленное до запуска бота придёт как обычное
-  сообщение, без привязки к реплаю.
-- Вся связка сообщений между площадками хранится в памяти процесса и
-  теряется при перезапуске бота (старые сообщения после перезапуска
-  уже нельзя отредактировать/реагировать через мост).
-- Опросы (Telegram/Discord polls) пересылаются как текстовый снимок
-  вопроса и вариантов на момент создания — не как настоящий
-  интерактивный опрос, и результаты голосования не обновляются.
-- Форматирование текста Telegram (жирный, курсив, зачёркнутый, код,
-  ссылки, спойлер) конвертируется в разметку Discord и в XEP-0393
-  Message Styling для XMPP. Подчёркивание и спойлеры не имеют аналога
-  в XEP-0393 — при пересылке в XMPP эти два вида просто теряют
-  оформление (текст остаётся, разметка — нет). Форматирование теперь
-  конвертируется в обе стороны между всеми тремя площадками (включая
-  Discord-markdown и XEP-0393 из Monocles Chat), хотя эта часть менее
-  строго проверена, чем разбор Telegram (там точные данные от Bot API,
-  здесь — эвристика по регуляркам).
-- Файлы с XMPP-стороны (в т.ч. голосовые) скачиваются и пересылаются
-  как настоящие вложения; если скачать по ссылке не удалось (например,
-  сервер требует авторизацию) — пересылается просто ссылкой.
-- У каждого автора (по стабильному id — Telegram user id, Discord user
-  id или XMPP-нику) появляется свой цветной значок из набора
-  🔴🟠🟡🟢🔵🟣⚫️⚪️🟤🔺🔻🔸🔹🔶🔷🔳🔲🟥🟧🟨🟩🟦🟪⬛️⬜️🟫, который
-  ставится перед именем при пересылке на другие площадки — так легче
-  различать, кто пишет, на площадках без аватарок/цветных ников.
-- Reply из Telegram/Discord корректно формируется по спецификации
-  XEP-0461 (проверено сверкой сырого XML), но не отображается как
-  визуальный reply ВНУТРИ самого Monocles Chat — похоже на ограничение
-  конкретно этого клиента в части отрисовки входящих reply от других
-  участников комнаты (составление и приём reply от Monocles к другим
-  площадкам работает нормально). Как запасной вариант, рядом со
-  структурированным reply в XMPP теперь дублируется текстовая цитата
-  ("> текст оригинала\nАвтор: ответ") — её увидит любой клиент,
-  независимо от поддержки XEP-0461.
-"""
-
 import asyncio
 import itertools
 import logging
@@ -170,8 +50,6 @@ from telegram.request import HTTPXRequest
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
-# TELEGRAM_CHAT_ID можно не указывать при первом запуске: бот всё равно
-# стартует и по команде /chatid пришлёт ID текущего чата.
 _raw_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_CHAT_ID = int(_raw_chat_id) if _raw_chat_id else None
 
@@ -195,19 +73,10 @@ BRIDGE_ENABLED = bool(TELEGRAM_CHAT_ID and (XMPP_ENABLED or DISCORD_ENABLED))
 # при рабочем интернете. TELEGRAM_FORCE_IPV4=true чинит это.
 TELEGRAM_FORCE_IPV4 = os.environ.get("TELEGRAM_FORCE_IPV4", "false").strip().lower() == "true"
 
-# ============================================================================
-# TELEGRAM USERBOT (MTProto/Telethon) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
-# Обычный Bot API в принципе не сообщает боту об удалении чужих (не самим
-# ботом отправленных) сообщений — см. подробный разбор в README. Обойти
-# это можно только полноценным входом в отдельный Telegram-аккаунт через
-# MTProto (см. generate_session.py) — тогда удаления обнаруживаются
-# МГНОВЕННО через событие, а не через периодический опрос.
-# Чтобы отключить — не задавайте TELEGRAM_USERBOT_SESSION.
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
 TELEGRAM_USERBOT_SESSION = os.environ.get("TELEGRAM_USERBOT_SESSION", "").strip()
 TELEGRAM_USERBOT_ENABLED = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_USERBOT_SESSION)
-# ============================================================================
 
 # ============================================================================
 # БАЗА ДАННЫХ (PostgreSQL, например Neon) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
@@ -576,12 +445,6 @@ async def _propagate_deletion(record: dict, skip: str) -> None:
 
     if skip != "xmpp" and xmpp_bridge and record.get("xmpp"):
         try:
-            # send_retraction_reliable, а не просто send_retraction —
-            # выяснили на практике, что одиночная retraction не всегда
-            # надёжно отображается в Monocles, а вот связка
-            # retraction+сообщение-с-replace на тот же id удаляет
-            # надёжно (Monocles сама отбрасывает такое сообщение целиком,
-            # что нас в случае настоящего удаления полностью устраивает).
             await xmpp_bridge.send_retraction_reliable(record["xmpp"])
         except Exception:
             logger.exception("Не удалось отправить удаление в XMPP")
@@ -754,7 +617,7 @@ def _strip_manual_quote_for_telegram(text: str) -> str:
     В отличие от _parse_manual_quote (который используется для XMPP и
     намеренно НЕ трогает вложенные ">>"-цитаты, чтобы не потерять
     настоящий текст при сопоставлении reply) — тут чистим агрессивно:
-    убираем ЛЮБые строки, начинающиеся с одного или нескольких ">",
+    убираем любые строки, начинающиеся с одного или нескольких ">",
     независимо от вложенности. Для Telegram нам не нужно ничего из
     этого сохранять — там и так есть нормальный reply."""
     if not text:
@@ -1055,56 +918,6 @@ def _convert_static_sticker_to_png(path: Path) -> Path:
     except Exception:
         logger.exception("Не удалось сконвертировать стикер в PNG, отправляю как есть")
         return path
-
-
-def _convert_gif_to_webp(path: Path) -> Path:
-    """Перекодирует анимированный gif в анимированный webp — используется
-    как запасной способ, когда сервер (замечено на xmpp.jp) отклоняет
-    загрузку именно gif/видео с 405, но принимает другие форматы.
-    Райзит исключение, если Pillow не установлен или что-то пошло не так
-    (вызывающий код должен сам это обработать)."""
-    from PIL import Image
-
-    webp_path = path.with_suffix(".webp")
-    with Image.open(path) as im:
-        frames = []
-        durations = []
-        try:
-            while True:
-                frames.append(im.convert("RGBA").copy())
-                durations.append(im.info.get("duration", 100))
-                im.seek(im.tell() + 1)
-        except EOFError:
-            pass
-        if not frames:
-            raise RuntimeError("не удалось прочитать ни одного кадра gif")
-        frames[0].save(
-            webp_path, "WEBP", save_all=True,
-            append_images=frames[1:], duration=durations, loop=0,
-        )
-    return webp_path
-
-
-async def _convert_video_to_webp(path: Path) -> Path:
-    """Перекодирует видео (используется, например, для "гифок" — Telegram
-    внутренне хранит их как .mp4, а не как настоящий .gif) в анимированный
-    webp через ffmpeg. Райзит исключение при любой проблеме (ffmpeg не
-    установлен / не смог декодировать / и т.п.) — вызывающий код должен
-    сам это обработать."""
-    webp_path = path.with_suffix(".webp")
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", str(path),
-        "-vcodec", "libwebp", "-filter:v", "fps=fps=15",
-        "-lossless", "0", "-compression_level", "6", "-q:v", "50",
-        "-loop", "0", "-an", "-vsync", "0",
-        str(webp_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _stdout, stderr = await proc.communicate()
-    if proc.returncode != 0 or not webp_path.exists():
-        raise RuntimeError(f"ffmpeg завершился с кодом {proc.returncode}: {stderr.decode(errors='replace')[:300]}")
-    return webp_path
 
 
 async def _download_discord_attachment(attachment) -> Path:
@@ -1794,41 +1607,16 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 url = await self._manual_upload_with_browser_headers(filepath)
                 logger.info("Обходной путь сработал — файл загружен вручную с браузерными заголовками")
             except Exception as manual_err:
-                logger.warning(
-                    "Ручная загрузка тоже не сработала (%s) — пробую перекодировать в WebP "
-                    "(для gif/анимаций; вдруг блокировка именно по типу файла)", manual_err,
-                )
-                webp_path = None
-                suffix_lower = filepath.suffix.lower()
-                if suffix_lower == ".gif":
-                    try:
-                        webp_path = _convert_gif_to_webp(filepath)
-                        url = await self._manual_upload_with_browser_headers(webp_path)
-                        logger.info("Обходной путь сработал — файл загружен как animated WebP")
-                    except Exception:
-                        logger.warning("Перекодирование в WebP тоже не помогло — сервер отклоняет файл (%s)", e)
-                        return await _fallback_link_or_error(f"(сервер отклонил загрузку файла: {e})")
-                    finally:
-                        if webp_path is not None:
-                            webp_path.unlink(missing_ok=True)
-                elif suffix_lower in (".mp4", ".mov", ".webm"):
-                    # Telegram хранит "гифки" внутри как видео (.mp4), а не
-                    # как настоящий .gif — конвертируем через ffmpeg.
-                    try:
-                        webp_path = await _convert_video_to_webp(filepath)
-                        url = await self._manual_upload_with_browser_headers(webp_path)
-                        logger.info("Обходной путь сработал — видео загружено как animated WebP")
-                    except Exception:
-                        logger.warning(
-                            "Перекодирование видео в WebP тоже не помогло — сервер отклоняет файл (%s)", e
-                        )
-                        return await _fallback_link_or_error(f"(сервер отклонил загрузку файла: {e})")
-                    finally:
-                        if webp_path is not None:
-                            webp_path.unlink(missing_ok=True)
-                else:
-                    logger.warning("Обходной путь тоже не сработал — сервер отклоняет файл (%s)", e)
-                    return await _fallback_link_or_error(f"(сервер отклонил загрузку файла: {e})")
+                # Перепробовали и смену расширения, и браузерные заголовки, и
+                # перекодирование в WebP (через Pillow/ffmpeg) — сервер
+                # (xmpp.jp) одинаково отклоняет загрузку независимо от
+                # формата и размера файла. Похоже на WAF с проверкой через
+                # JavaScript-челлендж (та же история, что и с Rustix/
+                # Pterodactyl для /mcstart) — такое принципиально не обойти
+                # обычным HTTP-клиентом без настоящего браузера. Дальше не
+                # пытаемся, просто сообщаем об ошибке.
+                logger.warning("Ручная загрузка тоже не сработала (%s) — сервер отклоняет файл", manual_err)
+                return await _fallback_link_or_error(f"(сервер отклонил загрузку файла: {e})")
         except IqError as e:
             logger.exception("Ошибка загрузки файла на XMPP-сервер")
             return await _fallback_link_or_error(f"(ошибка загрузки файла: {e})")
