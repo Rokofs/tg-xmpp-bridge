@@ -1726,6 +1726,25 @@ class DiscordBridge(_DiscordBase):
         self._recent_message_ids: set = set()
         self._recent_message_ids_order: list = []
 
+        # Настоящая slash-команда /start (появляется в автодополнении
+        # Discord при вводе "/") — раньше была просто проверка текста
+        # сообщения, из-за чего не показывалась в списке команд.
+        self.tree = discord.app_commands.CommandTree(self)
+
+        @self.tree.command(name="start", description="Сделать этот канал каналом моста")
+        async def start_command(interaction: "discord.Interaction"):
+            global DISCORD_CHANNEL_ID
+            DISCORD_CHANNEL_ID = interaction.channel_id
+            self.bridge_channel = interaction.channel
+            _db_save_setting("discord_channel_id", str(interaction.channel_id))
+            await interaction.response.send_message(
+                f"✅ Мост теперь работает в этом канале (id: `{interaction.channel_id}`)."
+            )
+            logger.info(
+                "Discord: канал моста установлен командой /start: #%s (%s)",
+                getattr(interaction.channel, "name", interaction.channel_id), interaction.channel_id,
+            )
+
     def _already_processed(self, message_id: int) -> bool:
         if message_id in self._recent_message_ids:
             return True
@@ -1737,10 +1756,14 @@ class DiscordBridge(_DiscordBase):
         return False
 
     async def on_ready(self):
+        try:
+            await self.tree.sync()
+        except Exception:
+            logger.exception("Не удалось синхронизировать slash-команды Discord")
         if DISCORD_CHANNEL_ID is None:
             logger.info(
-                "Discord: %s, — "
-                "впиши /start в нужном канале", self.user,
+                "Discord: подключился как %s, канал ещё не выбран — "
+                "напишите /start в нужном канале", self.user,
             )
             return
         channel = self.get_channel(DISCORD_CHANNEL_ID)
@@ -1758,20 +1781,6 @@ class DiscordBridge(_DiscordBase):
 
     async def on_message(self, message: "discord.Message"):
         if self.user and message.author.id == self.user.id:
-            return
-
-        if message.content.strip() == "/start":
-            global DISCORD_CHANNEL_ID
-            DISCORD_CHANNEL_ID = message.channel.id
-            self.bridge_channel = message.channel
-            _db_save_setting("discord_channel_id", str(message.channel.id))
-            await message.channel.send(
-                f"✅ Мост теперь работает в этом канале (id: `{message.channel.id}`)."
-            )
-            logger.info(
-                "Discord: канал моста установлен командой /start: #%s (%s)",
-                getattr(message.channel, "name", message.channel.id), message.channel.id,
-            )
             return
 
         if DISCORD_CHANNEL_ID is None or message.channel.id != DISCORD_CHANNEL_ID:
