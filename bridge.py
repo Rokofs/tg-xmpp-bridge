@@ -1739,8 +1739,8 @@ class DiscordBridge(_DiscordBase):
     async def on_ready(self):
         if DISCORD_CHANNEL_ID is None:
             logger.info(
-                "Discord: подключился как %s, канал ещё не выбран — "
-                "напишите /start в нужном канале", self.user,
+                "Discord: %s, — "
+                "впиши /start в нужном канале", self.user,
             )
             return
         channel = self.get_channel(DISCORD_CHANNEL_ID)
