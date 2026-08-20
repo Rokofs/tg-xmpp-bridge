@@ -64,7 +64,10 @@ XMPP_ENABLED = bool(XMPP_JID and XMPP_PASSWORD and XMPP_PEER_JID)
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip() or None
 _raw_discord_channel = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
 DISCORD_CHANNEL_ID = int(_raw_discord_channel) if _raw_discord_channel else None
-DISCORD_ENABLED = bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID)
+# Канал больше не обязателен заранее — можно задать через переменную
+# окружения ИЛИ командой /start прямо в нужном канале Discord (тогда
+# сохраняется в базу и переживает перезапуск, если подключён DATABASE_URL).
+DISCORD_ENABLED = bool(DISCORD_BOT_TOKEN)
 
 BRIDGE_ENABLED = bool(TELEGRAM_CHAT_ID and (XMPP_ENABLED or DISCORD_ENABLED))
 
@@ -222,10 +225,52 @@ async def _init_db() -> None:
                 )
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
         logger.info("База данных подключена — связка сообщений теперь переживёт перезапуск бота")
     except Exception:
         logger.exception("Не удалось подключиться к базе данных — работаю только в памяти (как раньше)")
         _db_pool = None
+
+
+def _db_save_setting(key: str, value: str) -> None:
+    """Сохраняет произвольную настройку (например, id канала Discord,
+    установленный командой /start) — асинхронно, не блокируя обработку."""
+    if _db_pool is None:
+        return
+    asyncio.create_task(_db_save_setting_impl(key, value))
+
+
+async def _db_save_setting_impl(key: str, value: str) -> None:
+    try:
+        async with _db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO bot_settings (key, value) VALUES ($1, $2)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                key, value,
+            )
+    except Exception:
+        logger.exception("Не удалось сохранить настройку %s в базу данных", key)
+
+
+async def _db_load_setting(key: str) -> Optional[str]:
+    if _db_pool is None:
+        return None
+    try:
+        async with _db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM bot_settings WHERE key = $1", key)
+            return row["value"] if row else None
+    except Exception:
+        logger.exception("Не удалось загрузить настройку %s из базы данных", key)
+        return None
 
 
 async def _load_from_db() -> None:
@@ -971,6 +1016,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         self.add_event_handler("message", self.on_xmpp_message)
         self.add_event_handler("reactions", self.on_xmpp_reactions)
         self.add_event_handler("message_retract", self.on_xmpp_retraction)
+        self.add_event_handler("disconnected", self.on_xmpp_disconnected)
 
         # client_id -> asyncio.Future, которое разрешается, когда сервер
         # комнаты отражает наше же сообщение обратно с настоящим
@@ -1001,6 +1047,20 @@ class XMPPBridge(slixmpp.ClientXMPP):
             logger.info("XMPP: зашёл в комнату %s как %s", XMPP_PEER_JID, XMPP_MUC_NICK)
 
         logger.info("XMPP: сессия начата, вошёл как %s", self.boundjid.bare)
+
+    async def on_xmpp_disconnected(self, event):
+        """Явная защита от того, что соединение может оборваться и не
+        восстановиться само (замечено на практике — XMPP-сторона моста
+        иногда переставала пересылать сообщения через день-два, тогда
+        как Discord продолжал работать нормально). Полагаться только на
+        встроенное поведение slixmpp оказалось недостаточно надёжно —
+        переподключаемся явно сами, с небольшой паузой."""
+        logger.warning("XMPP: соединение разорвано (%s) — переподключаюсь через 5 сек", event)
+        await asyncio.sleep(5)
+        try:
+            self.connect()
+        except Exception:
+            logger.exception("XMPP: не удалось переподключиться")
 
     def _is_from_peer(self, msg) -> bool:
         if XMPP_IS_MUC:
@@ -1677,6 +1737,12 @@ class DiscordBridge(_DiscordBase):
         return False
 
     async def on_ready(self):
+        if DISCORD_CHANNEL_ID is None:
+            logger.info(
+                "Discord: подключился как %s, канал ещё не выбран — "
+                "напишите /start в нужном канале", self.user,
+            )
+            return
         channel = self.get_channel(DISCORD_CHANNEL_ID)
         if channel is None:
             try:
@@ -1693,7 +1759,22 @@ class DiscordBridge(_DiscordBase):
     async def on_message(self, message: "discord.Message"):
         if self.user and message.author.id == self.user.id:
             return
-        if message.channel.id != DISCORD_CHANNEL_ID:
+
+        if message.content.strip() == "/start":
+            global DISCORD_CHANNEL_ID
+            DISCORD_CHANNEL_ID = message.channel.id
+            self.bridge_channel = message.channel
+            _db_save_setting("discord_channel_id", str(message.channel.id))
+            await message.channel.send(
+                f"✅ Мост теперь работает в этом канале (id: `{message.channel.id}`)."
+            )
+            logger.info(
+                "Discord: канал моста установлен командой /start: #%s (%s)",
+                getattr(message.channel, "name", message.channel.id), message.channel.id,
+            )
+            return
+
+        if DISCORD_CHANNEL_ID is None or message.channel.id != DISCORD_CHANNEL_ID:
             return
         if self._already_processed(message.id):
             logger.info("Discord прислал повторно уже обработанное сообщение %s — игнорирую", message.id)
@@ -2586,10 +2667,18 @@ async def _stop_telegram_userbot() -> None:
 # ========================================================================
 
 async def main() -> None:
-    global telegram_app, xmpp_bridge, discord_bridge
+    global telegram_app, xmpp_bridge, discord_bridge, DISCORD_CHANNEL_ID
 
     await _init_db()
     await _load_from_db()
+
+    saved_channel = await _db_load_setting("discord_channel_id")
+    if saved_channel:
+        try:
+            DISCORD_CHANNEL_ID = int(saved_channel)
+            logger.info("Discord: загружен ранее сохранённый канал (id: %s)", DISCORD_CHANNEL_ID)
+        except ValueError:
+            pass
 
     healthcheck_runner = await _start_healthcheck_server()
     await _start_telegram_userbot()
