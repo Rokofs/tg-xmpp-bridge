@@ -1733,6 +1733,12 @@ class DiscordBridge(_DiscordBase):
 
         @self.tree.command(name="start", description="Сделать этот канал каналом моста")
         async def start_command(interaction: "discord.Interaction"):
+            perms = interaction.user.guild_permissions if interaction.guild else None
+            if not perms or not perms.administrator:
+                await interaction.response.send_message(
+                    "⛔ Эта команда доступна только администраторам сервера.", ephemeral=True
+                )
+                return
             global DISCORD_CHANNEL_ID
             DISCORD_CHANNEL_ID = interaction.channel_id
             self.bridge_channel = interaction.channel
