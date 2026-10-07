@@ -215,6 +215,7 @@ async def _init_db() -> None:
                 )
                 """
             )
+            await conn.execute("ALTER TABLE bridge_records ADD COLUMN IF NOT EXISTS tg_human BOOLEAN")
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS recent_xmpp_texts (
@@ -281,7 +282,7 @@ async def _load_from_db() -> None:
     try:
         now = time.time()
         async with _db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT key, tg, xmpp, discord, xmpp_to, ts FROM bridge_records")
+            rows = await conn.fetch("SELECT key, tg, xmpp, discord, xmpp_to, ts, tg_human FROM bridge_records")
             loaded = 0
             for row in rows:
                 if now - row["ts"] > MESSAGE_MAP_TTL_SECONDS:
@@ -289,6 +290,7 @@ async def _load_from_db() -> None:
                 record = {
                     "tg": row["tg"], "xmpp": row["xmpp"], "discord": row["discord"],
                     "xmpp_to": row["xmpp_to"], "ts": row["ts"],
+                    "tg_human": True if row["tg_human"] is None else row["tg_human"],
                 }
                 _bridge_records[row["key"]] = record
                 _link_lookup(row["key"], record)
@@ -320,14 +322,14 @@ async def _db_save_record_impl(key: str, record: dict) -> None:
         async with _db_pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO bridge_records (key, tg, xmpp, discord, xmpp_to, ts)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO bridge_records (key, tg, xmpp, discord, xmpp_to, ts, tg_human)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (key) DO UPDATE SET
                     tg = EXCLUDED.tg, xmpp = EXCLUDED.xmpp, discord = EXCLUDED.discord,
-                    xmpp_to = EXCLUDED.xmpp_to, ts = EXCLUDED.ts
+                    xmpp_to = EXCLUDED.xmpp_to, ts = EXCLUDED.ts, tg_human = EXCLUDED.tg_human
                 """,
                 key, record.get("tg"), record.get("xmpp"), record.get("discord"),
-                record.get("xmpp_to"), record["ts"],
+                record.get("xmpp_to"), record["ts"], record.get("tg_human"),
             )
     except Exception:
         logger.exception("Не удалось сохранить связку сообщения в базу данных")
@@ -375,7 +377,8 @@ async def _db_save_recent_text_impl(key: str, text: str, ts: float) -> None:
 
 def _new_bridge_record(**ids) -> str:
     key = uuid.uuid4().hex
-    record = {"tg": None, "xmpp": None, "discord": None, "xmpp_to": None, "ts": time.time()}
+    record = {"tg": None, "xmpp": None, "discord": None, "xmpp_to": None, "ts": time.time(),
+              "tg_human": ids.get("tg") is not None}
     record.update({k: v for k, v in ids.items() if v is not None})
     _bridge_records[key] = record
     _link_lookup(key, record)
@@ -387,9 +390,12 @@ def _link_record(key: str, **ids) -> None:
     record = _bridge_records.get(key)
     if not record:
         return
+    old_xmpp = record.get("xmpp")
     for k, v in ids.items():
         if v is not None:
             record[k] = v
+    if old_xmpp is not None and record.get("xmpp") != old_xmpp:
+        _xmpp_lookup.pop(old_xmpp, None)
     _link_lookup(key, record)
     _db_save_record(key, record)
 
@@ -474,7 +480,12 @@ async def _mirror_reactions(key: str, emojis: set, skip: str) -> None:
 async def _propagate_deletion(record: dict, skip: str) -> None:
     """Удаляет сообщение на всех площадках, кроме skip (той, где его
     удалили изначально)."""
-    if skip != "tg" and telegram_app and record.get("tg"):
+    if skip != "tg" and record.get("tg") and record.get("tg_human", True):
+        logger.warning(
+            "Удаление из %s затрагивает оригинал пользователя в Telegram (id=%s) — не удаляю",
+            skip, record["tg"],
+        )
+    elif skip != "tg" and telegram_app and record.get("tg"):
         try:
             await telegram_app.bot.delete_message(chat_id=TELEGRAM_CHAT_ID, message_id=record["tg"])
         except BadRequest as e:
