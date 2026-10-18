@@ -1461,21 +1461,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
         except Exception:
             logger.exception("Не удалось отправить retraction перед правкой в XMPP")
 
-        # Текстовая цитата — по той же схеме, что и для обычных reply.
-        # Структурированный <reply> ниже не гарантированно отрисовывается
-        # (см. известные ограничения в README), а текст виден всегда.
-        mbody = new_text
-        key_for_quote = _xmpp_lookup.get(original_stanza_id)
-        if key_for_quote:
-            for k, text, _ts in reversed(_recent_xmpp_texts):
-                if k == key_for_quote:
-                    snippet = text.strip().replace("\n", " ")
-                    if len(snippet) > 150:
-                        snippet = snippet[:150].rstrip() + "…"
-                    mbody = f"> {snippet}\n{new_text}"
-                    break
-
-        stanza = self.make_message(mto=XMPP_PEER_JID, mbody=mbody, mtype=mtype)
+        stanza = self.make_message(mto=XMPP_PEER_JID, mbody=new_text, mtype=mtype)
         stanza.send()
         return stanza["id"]
 
