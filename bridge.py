@@ -124,6 +124,8 @@ logging.basicConfig(
 logger = logging.getLogger("tg_xmpp_bridge")
 logging.getLogger("slixmpp").setLevel(logging.WARNING)
 logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TMP_DIR = Path(tempfile.gettempdir()) / "tg_xmpp_bridge"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -544,6 +546,9 @@ def _get_xmpp_quote_preview(origin: str, replied_native_id) -> Optional[str]:
     структурированный XEP-0461 reply как настоящий ответ."""
     key = _get_reply_key(origin, replied_native_id)
     if not key:
+        return None
+    _rec = _bridge_records.get(key)
+    if _rec and _rec.get("xmpp"):
         return None
     for k, text, _ts in reversed(_recent_xmpp_texts):
         if k == key:
