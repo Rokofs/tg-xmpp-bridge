@@ -1,273 +1,103 @@
-# Внимание, бот ПОЛНОСТЬЮ сделан через Claude для личного использования. Выложил его сюда на случай, если кому-то нужен будет подобный бот-мост!
+# Telegram ↔ XMPP ↔ Discord bridge
 
+🇷🇺 [Русский](#русский) · 🇬🇧 [English](#english)
 
-# Telegram ↔ XMPP ↔ Discord мост
+> The bot was written entirely with Claude for personal use and is shared in case someone needs a similar bridge.
+> Бот полностью написан через Claude для личного использования; выложен на случай, если кому-то нужен такой мост.
 
-Пересылает текст и медиа между чатом Telegram, собеседником/комнатой в
-XMPP (xmpp.jp, monocles.eu и любой другой сервер с поддержкой HTTP
-Upload — этому требованию отвечает подавляющее большинство
-современных серверов, включая те, что используются с **Monocles
-Chat**) и каналом в Discord.
+## Files / Файлы
 
-## 1. Установка
+| File | Needed? |
+|---|---|
+| `bridge.py` | yes / да |
+| `Dockerfile` | yes / да |
+| `requirements.txt` | yes / да |
+| `README.md` | no, docs only / нет, только описание |
+| `.env.example` | no, a cheat sheet for variables / нет, шпаргалка по переменным |
+| `generate_session.py` | only once, locally, for MTProto / один раз локально, для MTProto |
 
-**Если ставишь сразу на хостинг — начинай с пункта 7.**
+Never commit real tokens. Put them in Render's Environment. / Не коммить настоящие токены — только в Environment на Render.
 
-Установи **Python 3.14** от имени админа. Обязательно поставь галочку
-**Add to Path** при установке.
+---
 
-Открой **CMD** или **PowerShell** от имени админа. Перейди в папку с
-ботом (`cd C:\Users\...`) и выполни одно из двух:
+## English
 
-**Linux / macOS** (терминал / bash):
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
+Messages, media, edits, deletions, reactions and replies are forwarded between a Telegram chat, an XMPP contact/room (MUC) and a Discord channel. XMPP and Discord are optional.
 
-**Windows**:
-```
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-```
+### Setup (all in the browser, no local install)
 
-После активации в начале строки появится `(venv)` — значит всё верно.
+1. **Telegram**: create a bot with [@BotFather](https://t.me/BotFather), add it to your group and make it **admin** (needed to receive reactions). Start the bot without `TELEGRAM_CHAT_ID`, send `/chatid` in the group and copy the number.
+2. **XMPP** (optional): register a separate account for the bot (e.g. on xmpp.jp). The server must support HTTP Upload. For a MUC, use the room JID (`room@conference.server`).
+3. **Discord** (optional): [Developer Portal](https://discord.com/developers/applications) → New Application → Bot → copy the token and enable **Message Content Intent**. Invite with scopes `bot` + `applications.commands` and permissions: Send Messages, Read Message History, Add Reactions, Attach Files, Manage Messages. The channel is chosen in Discord by an admin with `/start` (or set `DISCORD_CHANNEL_ID`).
+4. **Neon** (recommended): create a free project at [neon.com](https://neon.com), copy the connection string into `DATABASE_URL`. Tables are created automatically. It keeps message links across restarts, so replies, reactions and edits work on old messages. Without it everything lives in memory and is lost on restart.
+5. **Render**: push `bridge.py`, `Dockerfile`, `requirements.txt` to a (private) GitHub repo → New **Web Service** → Docker, Free instance → add the variables below in **Environment**. Build/Start commands stay empty.
+6. **UptimeRobot**: add an HTTP monitor for your Render URL, interval 5 min, so the free tier doesn't sleep.
+7. **Instant deletion detection** (optional): Bot API cannot see deleted messages. Use a separate Telegram account: get `API_ID`/`API_HASH` at [my.telegram.org](https://my.telegram.org), run `pip install telethon && python generate_session.py` once locally, put the three values in Environment, and join that account to the bridged chat. The session string is as sensitive as a password.
 
-## 2. Что нужно подготовить
+### Variables
 
-### Telegram
+| Variable | Description |
+|---|---|
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | required |
+| `XMPP_JID`, `XMPP_PASSWORD`, `XMPP_PEER_JID` | XMPP account and target |
+| `XMPP_IS_MUC`, `XMPP_MUC_NICK`, `XMPP_MUC_PASSWORD` | `true` if the target is a room; bot nick; room password |
+| `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID` | Discord |
+| `DATABASE_URL` | Neon connection string |
+| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_USERBOT_SESSION` | MTProto userbot |
+| `EDIT_WINDOW_SECONDS` | how long edits are forwarded (default 300) |
+| `MESSAGE_MAP_TTL_SECONDS` | how long message links are kept (default 180 days) |
+| `RECENT_XMPP_TEXTS_LIMIT` | recent XMPP texts kept for quote matching (default 2000) |
+| `TELEGRAM_DELETE_CHECK_INTERVAL` / `_BATCH` / `_DELAY` | polling check for deleted bot messages (default 300 s / 30 / 1.0 s) |
+| `TELEGRAM_FORWARD_CHECK_ENABLED` / `_MIN_INTERVAL` | probing for deleted foreign messages (default `true` / 12 h) |
+| `TELEGRAM_FORCE_IPV4` | `true` if the host has IPv6 problems |
 
-1. Напиши **@BotFather**, создай бота командой `/newbot`, получи токен.
-2. Добавь бота в нужную группу и **выдай ему права администратора** —
-   это важно не только для доступа к некоторым типам сообщений, но и
-   для получения реакций (`message_reaction`): без прав администратора
-   Telegram просто не присылает боту события о реакциях пользователей.
-3. **Узнай `chat_id` через сам бот** — это надёжнее сторонних ботов:
-   - впиши в `.env` только `TELEGRAM_BOT_TOKEN`, оставь
-     `TELEGRAM_CHAT_ID` и остальные переменные пустыми;
-   - запусти `python bridge.py` — бот стартует в ограниченном режиме
-     (мост ещё не активен, но бот уже онлайн);
-   - напиши боту команду `/chatid` в том чате/группе, который
-     собираешься мостить — он пришлёт число в ответ;
-   - впиши это число в `TELEGRAM_CHAT_ID` в `.env`.
+### Limitations
 
-### XMPP (необязательно)
+- Files over 20 MB can't be downloaded by the Bot API. GIFs/videos may be rejected by some XMPP upload servers (e.g. xmpp.jp).
+- Only plain-text edits are forwarded, not captions or files.
+- XMPP replies/reactions/retractions depend on the client's XEP support (Converse works; Monocles renders them poorly).
+- Polls are forwarded as a static text snapshot.
+- Deleting a bridged copy in XMPP/Discord never deletes a human's original Telegram message.
+- One instance = one chat set. Run several instances for several sets.
 
-1. Зарегистрируй **отдельный** аккаунт специально для бота, например
-   на `xmpp.jp` или `monocles.eu` (через любой XMPP-клиент вроде
-   Monocles Chat, Gajim, Conversations — там есть кнопка регистрации,
-   либо через `xmpp-http-upload`/`in-band registration`, если сервер
-   это разрешает).
-2. У своего основного аккаунта (в Monocles Chat) добавь бота в
-   контакты и подтверди взаимную подписку (presence subscription) —
-   иначе сообщения не будут доходить в обе стороны.
-3. Если мостишь в групповой чат (MUC) — узнай полный JID комнаты
-   (`room@conference.server`).
+---
 
-### Discord (необязательно)
+## Русский
 
-1. Зайди на **https://discord.com/developers/applications** →
-   **New Application** → задай имя.
-2. Слева открой раздел **Bot** → **Reset Token** (или **Add Bot**,
-   если ещё не создан) → скопируй токен в `DISCORD_BOT_TOKEN`.
-3. На той же странице **Bot** прокрути до **Privileged Gateway
-   Intents** и включи **MESSAGE CONTENT INTENT** — без него бот не
-   увидит текст сообщений.
-4. Слева открой **OAuth2 → URL Generator**:
-   - Scopes: отметь `bot`
-   - Bot Permissions: отметь как минимум `Send Messages`,
-     `Read Message History`, `Add Reactions`, `Attach Files`,
-     `Manage Messages` (нужно для снятия реакций при mirror'инге)
-   - Открой сгенерированную ссылку и добавь бота на свой сервер.
-5. В Discord включи **Режим разработчика** (User Settings → Advanced
-   → Developer Mode), затем правым кликом по нужному каналу → **Copy
-   Channel ID** → впиши в `DISCORD_CHANNEL_ID`.
+Пересылает сообщения, медиа, правки, удаления, реакции и ответы между чатом Telegram, собеседником/комнатой XMPP (MUC) и каналом Discord. XMPP и Discord необязательны.
 
-## 3. Настройка
+### Настройка (всё через браузер, локально ничего ставить не нужно)
 
-Сначала (как описано выше) заполни только `TELEGRAM_BOT_TOKEN` и
-узнай `TELEGRAM_CHAT_ID` через `/chatid`. Затем допиши остальные
-переменные (XMPP и Discord — по желанию).
+1. **Telegram**: создай бота в [@BotFather](https://t.me/BotFather), добавь в группу и сделай **админом** (нужно для реакций). Запусти бота без `TELEGRAM_CHAT_ID`, напиши `/chatid` в группе и скопируй число.
+2. **XMPP** (необязательно): заведи отдельный аккаунт для бота (например, на xmpp.jp). Сервер должен поддерживать HTTP Upload. Для MUC нужен JID комнаты (`room@conference.server`).
+3. **Discord** (необязательно): [Developer Portal](https://discord.com/developers/applications) → New Application → Bot → скопируй токен и включи **Message Content Intent**. Приглашай со scope `bot` + `applications.commands` и правами: Send Messages, Read Message History, Add Reactions, Attach Files, Manage Messages. Канал выбирает админ в Discord командой `/start` (или задай `DISCORD_CHANNEL_ID`).
+4. **Neon** (рекомендуется): создай бесплатный проект на [neon.com](https://neon.com), скопируй connection string в `DATABASE_URL`. Таблицы создаются сами. База хранит связки сообщений между перезапусками, поэтому ответы, реакции и правки работают и на старых сообщениях. Без неё всё хранится в памяти и теряется при перезапуске.
+5. **Render**: залей `bridge.py`, `Dockerfile`, `requirements.txt` в (приватный) репозиторий GitHub → New **Web Service** → Docker, Free → впиши переменные ниже в **Environment**. Build/Start команды оставь пустыми.
+6. **UptimeRobot**: добавь HTTP-монитор на адрес сервиса Render с интервалом 5 минут, чтобы бесплатный тариф не засыпал.
+7. **Мгновенное обнаружение удалений** (необязательно): Bot API не видит удалённые сообщения. Нужен отдельный аккаунт Telegram: получи `API_ID`/`API_HASH` на [my.telegram.org](https://my.telegram.org), один раз локально выполни `pip install telethon && python generate_session.py`, впиши три значения в Environment и добавь этот аккаунт в мостимый чат. Строка сессии равносильна паролю.
 
-Как подставить переменные окружения из `.env`:
+### Переменные
 
-**Linux / macOS:**
-```bash
-export $(grep -v '^#' .env | xargs)
-```
+| Переменная | Описание |
+|---|---|
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | обязательные |
+| `XMPP_JID`, `XMPP_PASSWORD`, `XMPP_PEER_JID` | аккаунт XMPP и адресат |
+| `XMPP_IS_MUC`, `XMPP_MUC_NICK`, `XMPP_MUC_PASSWORD` | `true`, если адресат — комната; ник бота; пароль комнаты |
+| `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID` | Discord |
+| `DATABASE_URL` | connection string от Neon |
+| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_USERBOT_SESSION` | MTProto-юзербот |
+| `EDIT_WINDOW_SECONDS` | сколько пересылаются правки (по умолчанию 300) |
+| `MESSAGE_MAP_TTL_SECONDS` | как долго помнить связки сообщений (по умолчанию 180 дней) |
+| `RECENT_XMPP_TEXTS_LIMIT` | сколько последних XMPP-текстов держать для сопоставления цитат (по умолчанию 2000) |
+| `TELEGRAM_DELETE_CHECK_INTERVAL` / `_BATCH` / `_DELAY` | проверка удаления сообщений бота опросом (по умолчанию 300 с / 30 / 1.0 с) |
+| `TELEGRAM_FORWARD_CHECK_ENABLED` / `_MIN_INTERVAL` | проверка удаления чужих сообщений (по умолчанию `true` / 12 ч) |
+| `TELEGRAM_FORCE_IPV4` | `true`, если у хостинга проблемы с IPv6 |
 
-**Windows PowerShell:**
-```powershell
-Get-Content .env | Where-Object { $_ -notmatch '^#' -and $_ -match '=' } | ForEach-Object {
-    $name, $value = $_.Split('=', 2)
-    Set-Item -Path "env:$name" -Value $value
-}
-```
+### Ограничения
 
-Либо проще — добавить в начало `bridge.py`:
-```python
-from dotenv import load_dotenv
-load_dotenv()
-```
-(и `pip install python-dotenv`), тогда `.env` будет подхватываться
-автоматически при каждом запуске, без ручного экспорта.
-
-## 4. Запуск
-
-```bash
-python bridge.py
-```
-
-**Первый запуск** (без `TELEGRAM_CHAT_ID` и XMPP/Discord-переменных)
-— бот в чате отвечает на `/chatid`, в консоли будет:
-```
-Мост НЕ активен — не заданы: TELEGRAM_CHAT_ID, XMPP_JID, XMPP_PASSWORD, XMPP_PEER_JID.
-Telegram-бот запущен в режиме /chatid (напишите /chatid в нужном чате)
-```
-
-**После полной настройки** и перезапуска:
-```
-Telegram-бот запущен, жду сообщений в чате -1001234567890
-XMPP: сессия начата, вошёл как bridgebot@xmpp.jp
-```
-
-Остановка — `Ctrl+C`.
-
-### 4.1 Если бот падает с `telegram.error.TimedOut` / `ConnectTimeout`
-
-Частая причина — VPN, который туннелирует только IPv4, тогда как
-библиотека `httpx` сначала пытается подключиться по IPv6 и «зависает»
-на этом, вместо быстрого отказа. Проверь: если
-```bash
-python -c "import urllib.request; print(urllib.request.urlopen('https://api.telegram.org', timeout=10).status)"
-```
-возвращает `200`, а сам бот всё равно падает с таймаутом — это оно.
-
-**Решение:** добавь в `.env`:
-```
-TELEGRAM_FORCE_IPV4=true
-```
-и перезапусти бота. Это заставит `httpx` использовать только IPv4, не
-трогая системные настройки сети.
-
-### 4.2 Если Telegram работает, а пересылка файлов в XMPP падает с `DNSError` / `ClientConnectorDNSError`
-
-Это отдельная (хоть и похожая) проблема: `slixmpp` использует для
-загрузки файлов (XEP-0363) библиотеку `aiohttp`, у которой свой
-DNS-резолвер — пакет `aiodns`. Он посылает DNS-запросы напрямую в
-обход системного DNS Windows, и многие VPN такие запросы не
-пропускают, хотя обычный интернет-трафик (включая Telegram) при этом
-работает нормально.
-
-**Решение** — убрать пакет с проблемным резолвером, `aiohttp`
-автоматически откатится на обычный:
-```bash
-pip uninstall aiodns pycares -y
-```
-После этого перезапусти бота.
-
-## 5. Как это работает
-
-- **Текст**: пересылается на все настроенные площадки (XMPP и/или
-  Discord) с именем автора. То же в обратную сторону — с XMPP и
-  Discord в Telegram.
-- **Медиа**: фото, видео, войсы, аудио, документы, стикеры пересылаются
-  между всеми тремя площадками. Для XMPP — через **HTTP Upload
-  (XEP-0363)** с OOB-ссылкой (XEP-0066).
-- **Редактирование**: если отредактировать текстовое сообщение в
-  течение `EDIT_WINDOW_SECONDS` (по умолчанию 5 минут), правка долетает
-  на другие площадки — через XEP-0308 для XMPP, обычное
-  `editMessageText` для Telegram, `message.edit()` для Discord.
-- **Реакции**: реакция на сообщение (👍❤️ и т.п.) на любой площадке
-  отражается на двух других — бот сам ставит соответствующую реакцию
-  от своего имени (это техническое ограничение платформ: невозможно
-  поставить реакцию на чужой площадке «от лица» пользователя другой
-  платформы). Требует прав администратора у Telegram-бота в чате.
-- **Ответы (reply)**: если ответить на пересланное мостом сообщение,
-  ответ придёт на других площадках как настоящий reply (со ссылкой на
-  исходное сообщение), а не просто текстом. Дополнительно в XMPP рядом
-  со структурированным reply дублируется текстовая цитата — для
-  клиентов, которые его не отрисовывают.
-- **Реакция через reply**: ответ ОДНИМ эмодзи (например, просто «👍»)
-  на пересланное сообщение считается реакцией, а не обычным ответом —
-  полезно, если в клиенте нет отдельной кнопки для реакций.
-- **Цветные метки авторов**: у каждого автора появляется свой цветной
-  значок (🔴🟠🟡🟢🔵...), стабильно закреплённый за ним, перед именем
-  при пересылке на другие площадки.
-
-## 6. Ограничения
-
-- Один экземпляр скрипта = один набор «чат Telegram + собеседник/комната
-  XMPP + канал Discord». Нужно несколько наборов — запускай несколько
-  процессов с разными `.env`.
-- Telegram Bot API не позволяет ботам скачивать файлы **больше 20 МБ**
-  — это ограничение самого Telegram, а не скрипта.
-- Редактирование (правка текста) работает только для обычного текста —
-  не для подписей к медиа и не для самих файлов. Реакции же работают и
-  на медиа тоже (фото, видео, кружки, голосовые, документы).
-- Если несколько разных людей одновременно реагируют разными эмодзи на
-  одно сообщение — на других площадках отражается только последнее
-  изменение, а не сумма всех реакций.
-- Reply с XMPP-стороны определяется, только если клиент шлёт настоящий
-  структурированный XEP-0461. Monocles Chat, судя по всему, пока просто
-  визуально имитирует цитату текстом в теле сообщения. Для этого случая
-  есть экспериментальная эвристика: бот пытается распознать такую
-  текстовую цитату и сопоставить её с недавно отправленными
-  сообщениями по содержимому. Не идеально — может ошибаться на похожих
-  или очень коротких сообщениях.
-- Вся связка сообщений между площадками хранится в памяти процесса и
-  теряется при перезапуске — старые (до перезапуска) сообщения после
-  этого уже нельзя отредактировать или прореагировать через мост.
-- Опросы (Telegram/Discord) пересылаются как текстовый снимок вопроса
-  и вариантов ответа на момент создания — не как интерактивный опрос,
-  голоса не обновляются.
-- Форматирование текста (жирный/курсив/зачёркнутый/код/ссылки/спойлер)
-  конвертируется между всеми тремя площадками (Telegram,
-  Discord-markdown, XEP-0393 из Monocles Chat). Подчёркивание и спойлер
-  в XMPP не имеют аналога в XEP-0393 — текст доходит, разметка
-  теряется. Конвертация из Telegram основана на точных данных Bot API
-  и надёжна; конвертация между XMPP/Discord — эвристика по регуляркам
-  (менее строгая, может ошибиться на нетипичной разметке).
-- Файлы с XMPP-стороны (включая голосовые) реально скачиваются и
-  пересылаются как вложения; если скачать не получилось — уйдёт просто
-  ссылкой.
-- Для продакшена бота стоит запускать под `systemd`, `supervisor` или
-  в Docker-контейнере с автоперезапуском при падении/потере сети.
-
-## 7. Хостинг (Render + GitHub)
-
-1. Регистрируешься на **GitHub**. Создаёшь новый **приватный**
-   репозиторий. Добавляешь туда `requirements.txt` и `bridge.py`.
-
-2. Регистрируешься на **Render.com**. Создаёшь **Web Service**,
-   подключаешь свой репозиторий с GitHub. При создании указываешь:
-   - **Language:** `Python 3`
-   - **Branch:** `main`
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `python bridge.py`
-
-3. В разделе **Environment** добавляешь переменные:
-
-   | Переменная | Значение |
-   |---|---|
-   | `TELEGRAM_BOT_TOKEN` | токен от BotFather |
-   | `TELEGRAM_CHAT_ID` | ID чата (число) |
-   | `XMPP_JID` | `av_resender@xmpp.jp` |
-   | `XMPP_PASSWORD` | пароль XMPP-аккаунта бота |
-   | `XMPP_PEER_JID` | `foxos@conference.xmpp.jp` |
-   | `XMPP_IS_MUC` | `true` |
-   | `XMPP_MUC_NICK` | `TelegramBridge` (или как у тебя сейчас) |
-   | `XMPP_MUC_PASSWORD` | пароль комнаты |
-   | `DISCORD_BOT_TOKEN` | токен бота |
-   | `DISCORD_CHANNEL_ID` | айди канала |
-
-4. Регистрируешься на **uptimerobot.com** и добавляешь туда ссылку с
-   Render (например, `https://tg-xmpp-bridge.onrender.com`). Ставишь
-   интервал **5 минут** — не даёт бесплатному тарифу Render усыпить
-   сервис.
-
-5. **Для обновления файлов бота** — заменить старый файл на GitHub,
-   после чего зайти в **Events** на Render. Дальше всё обновится само
-   (автодеплой).
+- Файлы больше 20 МБ Bot API скачать не даёт. GIF/видео могут отклоняться некоторыми XMPP-серверами загрузки (например, xmpp.jp).
+- Пересылаются правки только обычного текста, не подписей и не файлов.
+- Ответы/реакции/удаления в XMPP зависят от поддержки XEP в клиенте (Converse работает, Monocles отображает плохо).
+- Опросы пересылаются статичным текстом.
+- Удаление пересланной копии в XMPP/Discord никогда не удаляет исходное сообщение человека в Telegram.
+- Один экземпляр = один набор чатов. Для нескольких наборов запускай несколько экземпляров.
