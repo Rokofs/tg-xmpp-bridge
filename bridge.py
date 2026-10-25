@@ -13,9 +13,6 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    # pip install python-dotenv — тогда .env рядом со скриптом
-    # подхватится автоматически. Без пакета переменные нужно задавать
-    # вручную перед запуском.
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -44,9 +41,6 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-# ========================================================================
-# КОНФИГУРАЦИЯ (через переменные окружения)
-# ========================================================================
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
@@ -64,16 +58,10 @@ XMPP_ENABLED = bool(XMPP_JID and XMPP_PASSWORD and XMPP_PEER_JID)
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip() or None
 _raw_discord_channel = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
 DISCORD_CHANNEL_ID = int(_raw_discord_channel) if _raw_discord_channel else None
-# Канал больше не обязателен заранее — можно задать через переменную
-# окружения ИЛИ командой /start прямо в нужном канале Discord (тогда
-# сохраняется в базу и переживает перезапуск, если подключён DATABASE_URL).
 DISCORD_ENABLED = bool(DISCORD_BOT_TOKEN)
 
 BRIDGE_ENABLED = bool(TELEGRAM_CHAT_ID and (XMPP_ENABLED or DISCORD_ENABLED))
 
-# Некоторые VPN туннелируют только IPv4, а httpx/anyio по умолчанию
-# сначала пробует IPv6 и подолгу "виснет" — из-за этого TimedOut даже
-# при рабочем интернете. TELEGRAM_FORCE_IPV4=true чинит это.
 TELEGRAM_FORCE_IPV4 = os.environ.get("TELEGRAM_FORCE_IPV4", "false").strip().lower() == "true"
 
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
@@ -81,41 +69,16 @@ TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
 TELEGRAM_USERBOT_SESSION = os.environ.get("TELEGRAM_USERBOT_SESSION", "").strip()
 TELEGRAM_USERBOT_ENABLED = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_USERBOT_SESSION)
 
-# ============================================================================
-# БАЗА ДАННЫХ (PostgreSQL, например Neon) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
-# Без неё связка сообщений между площадками (для reply/реакций/правок)
-# живёт только в памяти процесса и обнуляется при каждом перезапуске.
-# С базой — переживает перезапуски, ограничена только MESSAGE_MAP_TTL_SECONDS.
-# Чтобы отключить — не задавайте DATABASE_URL (бот тогда работает как раньше,
-# только в памяти).
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip() or None
 DB_ENABLED = bool(DATABASE_URL)
-# ============================================================================
 
-# Сколько секунд после отправки сообщение можно ещё отредактировать и
-# получить исправление на других площадках.
 EDIT_WINDOW_SECONDS = int(os.environ.get("EDIT_WINDOW_SECONDS", "300"))
 
-# Как долго вообще помнить связку сообщений между площадками (нужно для
-# того, чтобы реакции и reply могли долетать спустя долгое время после
-# отправки). Раньше это было ограничено 6, потом 24 часами — но это было
-# ДО того, как появилась настоящая база данных (DATABASE_URL). Теперь,
-# когда связка не пропадает при перезапуске, можно позволить себе
-# хранить её действительно долго — по умолчанию 180 дней (полгода).
-# Место в базе это почти не расходует (каждая запись — пара id, десятки-
-# сотни байт), так что можно смело ставить и больше через переменную
-# окружения. Если DATABASE_URL НЕ задан (работа только в памяти) —
-# большой TTL смысла не имеет, всё равно обнулится при следующем
-# перезапуске/передеплое.
 MESSAGE_MAP_TTL_SECONDS = int(os.environ.get("MESSAGE_MAP_TTL_SECONDS", str(180 * 24 * 3600)))
 
-# Сколько последних XMPP-сообщений держать для эвристики "угадывания"
-# reply по тексту цитаты (для клиентов вроде Monocles, которые не шлют
-# структурированный <reply>, а вставляют "> текст" вручную). Раньше было
-# 200 — подняли, раз теперь есть настоящая база и место не проблема.
 RECENT_XMPP_TEXTS_LIMIT = int(os.environ.get("RECENT_XMPP_TEXTS_LIMIT", "2000"))
 
-TELEGRAM_BOT_API_FILE_LIMIT_MB = 20  # ограничение самого Telegram, не скрипта
+TELEGRAM_BOT_API_FILE_LIMIT_MB = 20
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,32 +94,12 @@ TMP_DIR = Path(tempfile.gettempdir()) / "tg_xmpp_bridge"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ========================================================================
-# СВЯЗКА СООБЩЕНИЙ МЕЖДУ ПЛОЩАДКАМИ (для правок и реакций)
-# ========================================================================
-# Каждое пересланное сообщение получает один "bridge key". Для него
-# храним, под каким id оно было отправлено на каждой из площадок —
-# это нужно, чтобы потом найти, ЧТО поправить/на чём поставить
-# реакцию, когда придёт событие с любой стороны.
-#
-# ВАЖНО: ключи — настоящие UUID, а не последовательный счётчик. Счётчик,
-# начинающий с 1 при каждом перезапуске, при подключённой базе данных
-# (DATABASE_URL) сталкивался бы с ключами старых записей, загруженных из
-# базы (у них тоже маленькие номера из прошлой сессии) — реакция/ответ
-# по такому "переиспользованному" ключу мог попасть на совершенно
-# другое, чужое сообщение.
-
-_bridge_records: dict = {}   # key -> {"tg": int|None, "xmpp": str|None, "discord": int|None, "ts": float}
-_tg_lookup: dict = {}        # tg_message_id -> key
-_xmpp_lookup: dict = {}      # xmpp_stanza_id -> key
-_discord_lookup: dict = {}   # discord_message_id -> key
+_bridge_records: dict = {}
+_tg_lookup: dict = {}
+_xmpp_lookup: dict = {}
+_discord_lookup: dict = {}
 
 
-# ------------------------------------------------------------------------
-# Цветные метки авторов — у каждого нового автора (по стабильному ключу
-# платформа+id) появляется свой цветной значок, который потом всегда
-# ставится рядом с его именем при пересылке на другие площадки.
-# ------------------------------------------------------------------------
 _COLOR_EMOJIS = [
     "🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚫️", "⚪️", "🟤",
     "🔺", "🔻", "🔸", "🔹", "🔶", "🔷", "🔳", "🔲",
@@ -167,8 +110,6 @@ _color_counter = itertools.count(0)
 
 
 def _colored_author(key: str, display_name: str) -> str:
-    """Возвращает "значок Имя" — значок стабильно закреплён за key
-    (например, "tg:12345" или "discord:98765" или "xmpp:nick")."""
     if key not in _author_colors:
         idx = next(_color_counter) % len(_COLOR_EMOJIS)
         _author_colors[key] = _COLOR_EMOJIS[idx]
@@ -176,21 +117,15 @@ def _colored_author(key: str, display_name: str) -> str:
 
 
 def _own_xmpp_reply_jid() -> str:
-    """JID, который надо указывать в 'to' у <reply>/<reactions> для
-    сообщений, которые в комнату/чат отправил сам бот (не важно, чей
-    текст внутри — TG или Discord автора)."""
     if XMPP_IS_MUC:
         return f"{XMPP_PEER_JID}/{XMPP_MUC_NICK}"
     return XMPP_PEER_JID
 
 
-_db_pool = None  # type: Optional["asyncpg.Pool"]
+_db_pool = None
 
 
 async def _init_db() -> None:
-    """Подключается к базе (если задан DATABASE_URL) и создаёт таблицы,
-    если их ещё нет. При любой ошибке просто отключает работу с базой —
-    бот продолжит работать как раньше, только в памяти."""
     global _db_pool
     if not DB_ENABLED:
         return
@@ -198,8 +133,8 @@ async def _init_db() -> None:
         import asyncpg
     except ImportError:
         logger.error(
-            "DATABASE_URL задан, но asyncpg не установлен (pip install asyncpg) — "
-            "связка сообщений будет жить только в памяти"
+            "DATABASE_URL is set but asyncpg is not installed (pip install asyncpg) — "
+            "message links will be kept in memory only"
         )
         return
     try:
@@ -236,15 +171,13 @@ async def _init_db() -> None:
                 )
                 """
             )
-        logger.info("База данных подключена — связка сообщений теперь переживёт перезапуск бота")
+        logger.info("Database connected — message links will now survive bot restarts")
     except Exception:
-        logger.exception("Не удалось подключиться к базе данных — работаю только в памяти (как раньше)")
+        logger.exception("Could not connect to the database — running in memory only")
         _db_pool = None
 
 
 def _db_save_setting(key: str, value: str) -> None:
-    """Сохраняет произвольную настройку (например, id канала Discord,
-    установленный командой /start) — асинхронно, не блокируя обработку."""
     if _db_pool is None:
         return
     asyncio.create_task(_db_save_setting_impl(key, value))
@@ -261,7 +194,7 @@ async def _db_save_setting_impl(key: str, value: str) -> None:
                 key, value,
             )
     except Exception:
-        logger.exception("Не удалось сохранить настройку %s в базу данных", key)
+        logger.exception("Could not save setting %s to the database", key)
 
 
 async def _db_load_setting(key: str) -> Optional[str]:
@@ -272,13 +205,11 @@ async def _db_load_setting(key: str) -> Optional[str]:
             row = await conn.fetchrow("SELECT value FROM bot_settings WHERE key = $1", key)
             return row["value"] if row else None
     except Exception:
-        logger.exception("Не удалось загрузить настройку %s из базы данных", key)
+        logger.exception("Could not load setting %s from the database", key)
         return None
 
 
 async def _load_from_db() -> None:
-    """Вызывается один раз при старте — подгружает в память всё, что ещё
-    не устарело (в рамках MESSAGE_MAP_TTL_SECONDS)."""
     if _db_pool is None:
         return
     try:
@@ -305,15 +236,14 @@ async def _load_from_db() -> None:
             for row in reversed(text_rows):
                 _recent_xmpp_texts.append((row["key"], row["body"], row["ts"]))
         logger.info(
-            "Загружено из базы: %s связок сообщений, %s недавних текстов для цитат",
+            "Loaded from the database: %s message links, %s recent texts for quotes",
             loaded, len(text_rows),
         )
     except Exception:
-        logger.exception("Не удалось загрузить связку сообщений из базы данных")
+        logger.exception("Could not load message links from the database")
 
 
 def _db_save_record(key: str, record: dict) -> None:
-    """Запись в базу — асинхронно, не блокируя основной поток обработки."""
     if _db_pool is None:
         return
     asyncio.create_task(_db_save_record_impl(key, record))
@@ -334,7 +264,7 @@ async def _db_save_record_impl(key: str, record: dict) -> None:
                 record.get("xmpp_to"), record["ts"], record.get("tg_human"),
             )
     except Exception:
-        logger.exception("Не удалось сохранить связку сообщения в базу данных")
+        logger.exception("Could not save the message link to the database")
 
 
 def _db_delete_record(key: str) -> None:
@@ -348,7 +278,7 @@ async def _db_delete_record_impl(key: str) -> None:
         async with _db_pool.acquire() as conn:
             await conn.execute("DELETE FROM bridge_records WHERE key = $1", key)
     except Exception:
-        logger.exception("Не удалось удалить связку сообщения из базы данных")
+        logger.exception("Could not delete the message link from the database")
 
 
 def _db_save_recent_text(key: str, text: str, ts: float) -> None:
@@ -364,7 +294,6 @@ async def _db_save_recent_text_impl(key: str, text: str, ts: float) -> None:
                 "INSERT INTO recent_xmpp_texts (key, body, ts) VALUES ($1, $2, $3)",
                 key, text, ts,
             )
-            # Не даём таблице расти бесконечно — оставляем только последние RECENT_XMPP_TEXTS_LIMIT.
             await conn.execute(
                 """
                 DELETE FROM recent_xmpp_texts WHERE id NOT IN (
@@ -374,7 +303,7 @@ async def _db_save_recent_text_impl(key: str, text: str, ts: float) -> None:
                 RECENT_XMPP_TEXTS_LIMIT,
             )
     except Exception:
-        logger.exception("Не удалось сохранить текст для цитаты в базу данных")
+        logger.exception("Could not save quote text to the database")
 
 
 def _new_bridge_record(**ids) -> str:
@@ -430,10 +359,6 @@ def _prune_bridge_records() -> None:
 
 
 def _forget_record_by_key(key: Optional[str]) -> None:
-    """Полностью убирает связку из памяти — вызывается после того, как
-    удаление сообщения уже разослано на все площадки, чтобы то же самое
-    "мёртвое" сообщение не находилось заново на следующих проверках
-    (иначе бот будет бесконечно пересоздавать заглушку "удалено")."""
     if not key:
         return
     record = _bridge_records.pop(key, None)
@@ -451,7 +376,6 @@ def _forget_record_by_key(key: Optional[str]) -> None:
 
 
 async def _mirror_reactions(key: str, emojis: set, skip: str) -> None:
-    """Проставляет набор реакций emojis на всех площадках, кроме skip."""
     record = _bridge_records.get(key)
     if not record:
         return
@@ -460,13 +384,13 @@ async def _mirror_reactions(key: str, emojis: set, skip: str) -> None:
         try:
             await xmpp_bridge.send_reaction(record["xmpp"], emojis)
         except Exception:
-            logger.exception("Не удалось переслать реакцию в XMPP")
+            logger.exception("Could not forward the reaction to XMPP")
 
     if skip != "discord" and discord_bridge and record.get("discord"):
         try:
             await discord_bridge.set_reactions(record["discord"], emojis)
         except Exception:
-            logger.exception("Не удалось переслать реакцию в Discord")
+            logger.exception("Could not forward the reaction to Discord")
 
     if skip != "tg" and telegram_app and record.get("tg"):
         try:
@@ -476,15 +400,13 @@ async def _mirror_reactions(key: str, emojis: set, skip: str) -> None:
                 reaction=[ReactionTypeEmoji(e) for e in emojis] if emojis else [],
             )
         except Exception:
-            logger.exception("Не удалось переслать реакцию в Telegram")
+            logger.exception("Could not forward the reaction to Telegram")
 
 
 async def _propagate_deletion(record: dict, skip: str) -> None:
-    """Удаляет сообщение на всех площадках, кроме skip (той, где его
-    удалили изначально)."""
     if skip != "tg" and record.get("tg") and record.get("tg_human", True):
         logger.warning(
-            "Удаление из %s затрагивает оригинал пользователя в Telegram (id=%s) — не удаляю",
+            "Deletion from %s targets a user's original Telegram message (id=%s) — not deleting",
             skip, record["tg"],
         )
     elif skip != "tg" and telegram_app and record.get("tg"):
@@ -492,33 +414,26 @@ async def _propagate_deletion(record: dict, skip: str) -> None:
             await telegram_app.bot.delete_message(chat_id=TELEGRAM_CHAT_ID, message_id=record["tg"])
         except BadRequest as e:
             if "message to delete not found" in str(e).lower():
-                # Уже удалено (например, другой путь обнаружения удаления
-                # сработал параллельно чуть раньше) — не ошибка, просто
-                # гонка, ничего страшного.
                 pass
             else:
-                logger.exception("Не удалось удалить сообщение в Telegram")
+                logger.exception("Could not delete the message in Telegram")
         except Exception:
-            logger.exception("Не удалось удалить сообщение в Telegram")
+            logger.exception("Could not delete the message in Telegram")
 
     if skip != "xmpp" and xmpp_bridge and record.get("xmpp"):
         try:
             await xmpp_bridge.send_retraction_reliable(record["xmpp"])
         except Exception:
-            logger.exception("Не удалось отправить удаление в XMPP")
+            logger.exception("Could not send the deletion to XMPP")
 
     if skip != "discord" and discord_bridge and record.get("discord"):
         try:
             await discord_bridge.delete_message(record["discord"])
         except Exception:
-            logger.exception("Не удалось удалить сообщение в Discord")
+            logger.exception("Could not delete the message in Discord")
 
 
 def _get_reply_targets(origin: str, replied_native_id) -> dict:
-    """По id сообщения, на которое отвечают (на площадке origin),
-    возвращает id этого же сообщения на двух других площадках —
-    чтобы отправить туда настоящий reply, а не просто текст.
-    """
     if replied_native_id is None:
         return {}
     _prune_bridge_records()
@@ -531,7 +446,6 @@ def _get_reply_targets(origin: str, replied_native_id) -> dict:
 
 
 def _get_reply_key(origin: str, replied_native_id) -> Optional[str]:
-    """То же, что _get_reply_targets, но возвращает сам bridge key (для реакций)."""
     if replied_native_id is None:
         return None
     _prune_bridge_records()
@@ -540,10 +454,6 @@ def _get_reply_key(origin: str, replied_native_id) -> Optional[str]:
 
 
 def _get_xmpp_quote_preview(origin: str, replied_native_id) -> Optional[str]:
-    """Возвращает короткий текстовый превью сообщения, на которое отвечают,
-    чтобы вставить его цитатой ("> ...") в само тело XMPP-сообщения —
-    "по старинке", для клиентов вроде Monocles Chat, которые не рисуют
-    структурированный XEP-0461 reply как настоящий ответ."""
     key = _get_reply_key(origin, replied_native_id)
     if not key:
         return None
@@ -552,10 +462,6 @@ def _get_xmpp_quote_preview(origin: str, replied_native_id) -> Optional[str]:
         return None
     for k, text, _ts in reversed(_recent_xmpp_texts):
         if k == key:
-            # Если цитируемое сообщение само уже содержит вложенную цитату
-            # (например, это был чей-то предыдущий ответ) — берём только
-            # "новую" часть, а не всё целиком. Иначе с каждым следующим
-            # ответом в цепочке цитата разрастается ("> > > > ...").
             if text.strip().startswith(">"):
                 _quoted, remaining = _parse_manual_quote(text)
                 if remaining:
@@ -567,18 +473,7 @@ def _get_xmpp_quote_preview(origin: str, replied_native_id) -> Optional[str]:
     return None
 
 
-# ------------------------------------------------------------------------
-# ЭКСПЕРИМЕНТАЛЬНОЕ: распознавание "ручных" текстовых цитат Monocles Chat
-# ------------------------------------------------------------------------
-# Monocles Chat, судя по всему, не отправляет структурированный XEP-0461
-# reply — вместо этого он просто вставляет цитату исходного сообщения
-# текстом прямо в тело: "> исходный текст\n\nновый текст". Ниже — попытка
-# распознать такую цитату и сопоставить её с недавно отправленными в эту
-# же XMPP-комнату сообщениями по содержимому текста, чтобы всё равно
-# получить настоящий reply на других площадках. Метод эвристический —
-# может ошибаться на коротких/похожих сообщениях.
-
-_recent_xmpp_texts: list = []  # [(key, text, ts), ...]
+_recent_xmpp_texts: list = []
 
 
 def _remember_xmpp_text(key: str, text: str) -> None:
@@ -596,10 +491,6 @@ def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
     quoted = (quoted or "").strip()
     if not quoted:
         return None
-    # Нормализуем пробельные символы перед сравнением: _parse_manual_quote
-    # склеивает строки цитаты пробелами, а сохранённый оригинал текста
-    # хранит настоящие переносы строк — без нормализации многострочные
-    # сообщения никогда не совпадут как подстрока.
     quoted_normalized = " ".join(quoted.split())
     now = time.time()
     for key, text, ts in reversed(_recent_xmpp_texts):
@@ -610,17 +501,6 @@ def _find_key_by_quoted_text(quoted: str) -> Optional[str]:
         text_normalized = " ".join(text.split())
         if quoted_normalized in text_normalized or text_normalized in quoted_normalized:
             return key
-    # ВРЕМЕННАЯ ДИАГНОСТИКА: совпадение не нашлось — печатаем repr()
-    # (видны скрытые/невидимые символы, которые иногда вставляет
-    # Monocles) и несколько последних запомненных текстов для сравнения.
-    try:
-        recent_sample = [(k, t) for k, t, _ts in list(reversed(_recent_xmpp_texts))[:5]]
-        logger.info(
-            "ДИАГНОСТИКА: не нашлось совпадение цитаты. quoted=%r; последние запомненные тексты: %r",
-            quoted, recent_sample,
-        )
-    except Exception:
-        pass
     return None
 
 
@@ -628,21 +508,6 @@ _MOBILE_QUOTE_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*\(G
 
 
 def _parse_manual_quote(body: str):
-    """Разбирает тело сообщения на "цитируемую" часть (строки, начинающиеся
-    с "> ") и обычный текст — сканирует ВСЕ строки сообщения, а не только
-    идущие подряд с самого начала (цитата может быть не первой). Не
-    считает цитатой вложенные "> >" (чужая цитата внутри цитаты). Также
-    учитывает особенность некоторых мобильных XMPP-клиентов, которые
-    перед самой цитатой вставляют отдельную служебную строку вида
-    "2024-01-01  12:00 (GMT+0000)" — такую строку (и предшествующую ей
-    строку с именем отправителя) не считаем частью реальной цитаты.
-
-    Возвращает (quoted_text, remaining_text). Если цитаты нет —
-    (None, body).
-
-    Подход подсмотрен в похожем проекте jabagram (ventureoo/jabagram,
-    GPL-3.0) и переписан под наш стиль.
-    """
     quoted_lines: list = []
     other_lines: list = []
 
@@ -650,9 +515,6 @@ def _parse_manual_quote(body: str):
         if line[:1] == ">" and line[1:2] == " " and line[2:3] != ">":
             content = line[2:].strip()
             if _MOBILE_QUOTE_TIMESTAMP_RE.match(content):
-                # служебная строка с датой/временем от мобильного клиента —
-                # значит, и предыдущая добавленная строка (имя автора)
-                # тоже была служебной, а не текстом цитаты
                 if quoted_lines:
                     quoted_lines.pop()
             else:
@@ -669,18 +531,6 @@ def _parse_manual_quote(body: str):
 
 
 def _strip_manual_quote_for_telegram(text: str) -> str:
-    """Убирает "сырые" ручные цитаты из текста перед отправкой в Telegram —
-    там уже работает настоящий reply_to_message_id, а вложенный текст
-    цитаты только захламляет сообщение (особенно после нескольких
-    "прыжков" через сторонних ботов вроде matrixt2bot/ChatResender, у
-    каждого из которых свой формат цитирования текстом).
-
-    В отличие от _parse_manual_quote (который используется для XMPP и
-    намеренно НЕ трогает вложенные ">>"-цитаты, чтобы не потерять
-    настоящий текст при сопоставлении reply) — тут чистим агрессивно:
-    убираем любые строки, начинающиеся с одного или нескольких ">",
-    независимо от вложенности. Для Telegram нам не нужно ничего из
-    этого сохранять — там и так есть нормальный reply."""
     if not text:
         return text
     lines = []
@@ -688,9 +538,6 @@ def _strip_manual_quote_for_telegram(text: str) -> str:
         stripped = line.lstrip()
         if stripped.startswith(">"):
             continue
-        # Строка, целиком состоящая из голой ссылки — почти всегда
-        # дублирующая ссылка на уже прикреплённый/процитированный файл
-        # (Monocles вставляет такие ссылки текстом внутри цитат).
         if re.fullmatch(r"https?://\S+", line.strip()):
             continue
         lines.append(line)
@@ -698,10 +545,6 @@ def _strip_manual_quote_for_telegram(text: str) -> str:
     return remaining if remaining else text
 
 
-# Простое (не идеальное) распознавание "текст состоит только из эмодзи" —
-# без внешней зависимости на пакет `emoji`. Покрывает подавляющее
-# большинство современных эмодзи (включая ZWJ-последовательности и
-# variation selector), но не претендует на 100% полноту юникода.
 _EMOJI_ONLY_RE = re.compile(
     r"^[\s\u2600-\u27BF\U0001F000-\U0001FFFF\u2190-\u21FF\u2300-\u23FF\uFE0F\u200D]+$"
 )
@@ -715,11 +558,6 @@ def _is_emoji_only(text: str) -> bool:
 
 
 def _extract_emojis(text: str) -> set:
-    """Пытается разбить текст на отдельные эмодзи через пакет `emoji`
-    (если установлен), иначе просто возвращает весь текст одним
-    элементом множества — этого достаточно для типичного случая
-    "ответ одним эмодзи".
-    """
     try:
         import emoji as emoji_lib
         found = {m["emoji"] for m in emoji_lib.emoji_list(text)}
@@ -730,16 +568,10 @@ def _extract_emojis(text: str) -> set:
     return {text.strip()}
 
 
-# Модульные ссылки на "живые" мосты — заполняются в main(), используются
-# отовсюду для кросс-пересылки без сложных циклических зависимостей.
 telegram_app: Optional[Application] = None
-xmpp_bridge = None       # type: Optional["XMPPBridge"]
-discord_bridge = None    # type: Optional["DiscordBridge"]
+xmpp_bridge = None
+discord_bridge = None
 
-
-# ========================================================================
-# ОБЩИЕ ПОМОЩНИКИ
-# ========================================================================
 
 _DISCORD_MARKERS = {
     "b": "**", "strong": "**",
@@ -747,9 +579,6 @@ _DISCORD_MARKERS = {
     "u": "__", "ins": "__",
     "s": "~~", "strike": "~~", "del": "~~",
 }
-# XEP-0393 (Message Styling) поддерживает только *bold*, _italic_, ~strike~,
-# `code`/```pre``` и > quote — нет подчёркивания и спойлеров, поэтому для
-# них маркер просто пустой (форматирование теряется, но текст остаётся).
 _XMPP_MARKERS = {
     "b": "*", "strong": "*",
     "i": "_", "em": "_",
@@ -758,17 +587,13 @@ _XMPP_MARKERS = {
 
 
 def _format_from_telegram_html(html_text: str, target: str) -> str:
-    """Конвертирует HTML-разметку Telegram (msg.text_html/caption_html) в
-    разметку, понятную XMPP (XEP-0393 Message Styling) или Discord
-    (обычный markdown). target: 'xmpp' или 'discord'.
-    """
     markers = _DISCORD_MARKERS if target == "discord" else _XMPP_MARKERS
 
     class _Conv(HTMLParser):
         def __init__(self):
             super().__init__(convert_charrefs=True)
             self.out = []
-            self.tag_stack = []  # [(tag, "закрывающий_маркер_или_href")]
+            self.tag_stack = []
 
         def handle_starttag(self, tag, attrs):
             attrs_dict = dict(attrs)
@@ -784,9 +609,6 @@ def _format_from_telegram_html(html_text: str, target: str) -> str:
                 self.out.append("```")
             elif tag == "a":
                 href = attrs_dict.get("href", "")
-                # tg://user?id=... — упоминание пользователя без username
-                # (и вообще любые внутренние tg:// ссылки). Они нерабочие
-                # за пределами Telegram — не дописываем их в скобках.
                 is_internal = href.startswith("tg://")
                 self.tag_stack.append(("a", (href, is_internal)))
                 if target == "discord" and not is_internal:
@@ -808,7 +630,7 @@ def _format_from_telegram_html(html_text: str, target: str) -> str:
             if _open_tag == "a":
                 href, is_internal = marker
                 if is_internal:
-                    pass  # оставляем голый текст метки, без ссылки
+                    pass
                 elif target == "discord":
                     self.out.append(f"]({href})")
                 elif href:
@@ -826,29 +648,16 @@ def _format_from_telegram_html(html_text: str, target: str) -> str:
         conv.feed(html_text)
         conv.close()
     except Exception:
-        logger.exception("Не удалось разобрать форматирование Telegram, отправляю как обычный текст")
+        logger.exception("Could not parse Telegram formatting, sending as plain text")
         return html_text
     return "".join(conv.out)
 
 
 def _format_tg_text(plain_text: Optional[str], html_text: Optional[str], target: str) -> str:
-    """Возвращает текст сообщения с конвертированным форматированием,
-    либо обычный текст, если форматирования нет/распознать не удалось.
-    """
     if not html_text:
         return plain_text or ""
     return _format_from_telegram_html(html_text, target)
 
-
-# ------------------------------------------------------------------------
-# ЭКСПЕРИМЕНТАЛЬНОЕ: конвертация разметки Discord (markdown) и XMPP
-# (XEP-0393 Message Styling) друг в друга и в Telegram HTML.
-# ------------------------------------------------------------------------
-# В отличие от Telegram (где есть точные entity с offset/length),
-# здесь приходится РАСПОЗНАВАТЬ разметку по текстовым маркерам через
-# регулярки — это эвристика: не гарантирует идеальную обработку
-# вложенной/пересекающейся или "случайной" разметки (например, если в
-# обычном тексте просто встретилась одинокая звёздочка).
 
 _MD_CODEBLOCK_RE = re.compile(r"```.*?```", re.S)
 _MD_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
@@ -856,16 +665,12 @@ _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 
 
 def _convert_markup(text: str, source: str, target: str) -> str:
-    """source/target: 'discord' | 'xmpp' | 'telegram' (telegram — только
-    как target, для получения HTML с parse_mode='HTML').
-    """
     if not text or source == target:
         return _html_escape(text, quote=False) if target == "telegram" else text
 
     if target == "telegram":
         text = _html_escape(text, quote=False)
 
-    # 1. Прячем code/pre-блоки от дальнейшей обработки
     code_stash = []
 
     def _stash_code(m):
@@ -875,7 +680,6 @@ def _convert_markup(text: str, source: str, target: str) -> str:
     text = _MD_CODEBLOCK_RE.sub(_stash_code, text)
     text = _MD_INLINE_CODE_RE.sub(_stash_code, text)
 
-    # 2. Прячем ссылки [текст](url)
     link_stash = []
 
     def _stash_link(m):
@@ -884,12 +688,7 @@ def _convert_markup(text: str, source: str, target: str) -> str:
 
     text = _MD_LINK_RE.sub(_stash_link, text)
 
-    # 3. Распознаём маркеры разметки и СРАЗУ прячем их за плейсхолдеры
-    # (а не сразу подставляем целевой синтаксис!) — иначе, например,
-    # только что созданный "*bold*" для XMPP тут же попадётся под руку
-    # регулярке italic и испортится. Реальный целевой синтаксис
-    # подставляется только в конце, за один проход.
-    style_stash = []  # [(kind, inner_text), ...]
+    style_stash = []
 
     def _make_style_stasher(kind):
         def _sub(m):
@@ -903,7 +702,7 @@ def _convert_markup(text: str, source: str, target: str) -> str:
         text = re.sub(r"~~(.+?)~~", _make_style_stasher("strike"), text, flags=re.S)
         text = re.sub(r"\|\|(.+?)\|\|", _make_style_stasher("spoiler"), text, flags=re.S)
         text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", _make_style_stasher("italic"), text)
-    else:  # xmpp (XEP-0393) — одиночные маркеры, без подчёркивания/спойлера
+    else:
         text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", _make_style_stasher("bold"), text)
         text = re.sub(r"(?<!_)_([^_\n]+?)_(?!_)", _make_style_stasher("italic"), text)
         text = re.sub(r"(?<!~)~([^~\n]+?)~(?!~)", _make_style_stasher("strike"), text)
@@ -921,8 +720,6 @@ def _convert_markup(text: str, source: str, target: str) -> str:
         },
         "xmpp": {
             "bold": ("*", "*"), "italic": ("_", "_"), "strike": ("~", "~"),
-            # подчёркивания/спойлера в XEP-0393 нет — просто нет записи,
-            # ниже это означает "убрать разметку, оставить только текст"
         },
     }
     mapping = _TARGET_SYNTAX[target]
@@ -932,10 +729,9 @@ def _convert_markup(text: str, source: str, target: str) -> str:
             open_m, close_m = mapping[kind]
             replacement = f"{open_m}{inner}{close_m}"
         else:
-            replacement = inner  # аналога нет — оставляем только текст
+            replacement = inner
         text = text.replace(placeholder, replacement)
 
-    # 4. Восстанавливаем ссылки
     for i, (label, url) in enumerate(link_stash):
         placeholder = f"\x01{i}\x01"
         if target == "telegram":
@@ -946,7 +742,6 @@ def _convert_markup(text: str, source: str, target: str) -> str:
             replacement = url if label == url else f"{label} ({url})"
         text = text.replace(placeholder, replacement)
 
-    # 5. Восстанавливаем code/pre
     for i, original in enumerate(code_stash):
         placeholder = f"\x00{i}\x00"
         if target == "telegram":
@@ -957,18 +752,17 @@ def _convert_markup(text: str, source: str, target: str) -> str:
                 inner = original.strip("`")
                 replacement = f"<code>{inner}</code>"
         else:
-            replacement = original  # discord/xmpp код-разметка совпадает по синтаксису
+            replacement = original
         text = text.replace(placeholder, replacement)
 
     return text
 
 
 def _convert_static_sticker_to_png(path: Path) -> Path:
-    """Конвертирует статический webp-стикер в PNG для совместимости."""
     try:
         from PIL import Image
     except ImportError:
-        logger.warning("Pillow не установлен — статический стикер отправится как .webp")
+        logger.warning("Pillow is not installed — the static sticker will be sent as .webp")
         return path
     try:
         png_path = path.with_suffix(".png")
@@ -977,7 +771,7 @@ def _convert_static_sticker_to_png(path: Path) -> Path:
         path.unlink(missing_ok=True)
         return png_path
     except Exception:
-        logger.exception("Не удалось сконвертировать стикер в PNG, отправляю как есть")
+        logger.exception("Could not convert the sticker to PNG, sending as is")
         return path
 
 
@@ -995,7 +789,6 @@ async def _download_discord_attachment(attachment) -> Path:
 
 
 async def _download_url_to_file(url: str) -> Path:
-    """Скачивает файл по прямой ссылке (используется для OOB-ссылок из XMPP)."""
     import hashlib
     import mimetypes
     import aiohttp
@@ -1007,7 +800,6 @@ async def _download_url_to_file(url: str) -> Path:
             data = await resp.read()
             content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
 
-    # Пытаемся определить расширение: сначала из самого URL, иначе по Content-Type.
     suffix = Path(urlparse(url).path).suffix
     if not suffix and content_type:
         suffix = mimetypes.guess_extension(content_type) or ""
@@ -1018,12 +810,7 @@ async def _download_url_to_file(url: str) -> Path:
     return local_path
 
 
-# ========================================================================
-# XMPP-СТОРОНА
-# ========================================================================
-
 class XMPPBridge(slixmpp.ClientXMPP):
-    """XMPP-клиент, принимающий/отправляющий текст, файлы, правки, реакции."""
 
     def __init__(self, jid: str, password: str):
         super().__init__(jid, password)
@@ -1034,25 +821,21 @@ class XMPPBridge(slixmpp.ClientXMPP):
         self.add_event_handler("message_retract", self.on_xmpp_retraction)
         self.add_event_handler("disconnected", self.on_xmpp_disconnected)
 
-        # client_id -> asyncio.Future, которое разрешается, когда сервер
-        # комнаты отражает наше же сообщение обратно с настоящим
-        # stanza-id (см. _learn_own_stanza_id и send_text/send_file).
         self._pending_echo_futures: dict = {}
 
-        self.register_plugin("xep_0030")  # Service Discovery
-        self.register_plugin("xep_0115")  # Entity Capabilities — ОБЯЗАТЕЛЕН по спеке XEP-0444
-        # для того, чтобы другие клиенты доверяли нашей поддержке реакций
-        self.register_plugin("xep_0128")  # Service Discovery Extensions — зависимость xep_0363
-        self.register_plugin("xep_0199")  # XMPP Ping — держит соединение живым
-        self.register_plugin("xep_0066")  # Out of Band Data — ссылки на файлы
-        self.register_plugin("xep_0363")  # HTTP Upload
-        self.register_plugin("xep_0045")  # Multi-User Chat
-        self.register_plugin("xep_0308")  # Last Message Correction — редактирование
-        self.register_plugin("xep_0334")  # Message Processing Hints — зависимость xep_0444
-        self.register_plugin("xep_0444")  # Message Reactions
-        self.register_plugin("xep_0461")  # Message Replies — настоящие ответы на сообщения
-        self.register_plugin("xep_0359")  # Unique and Stable Stanza IDs — нужен для reply/реакций в MUC
-        self.register_plugin("xep_0424")  # Message Retraction — удаление сообщений
+        self.register_plugin("xep_0030")
+        self.register_plugin("xep_0115")
+        self.register_plugin("xep_0128")
+        self.register_plugin("xep_0199")
+        self.register_plugin("xep_0066")
+        self.register_plugin("xep_0363")
+        self.register_plugin("xep_0045")
+        self.register_plugin("xep_0308")
+        self.register_plugin("xep_0334")
+        self.register_plugin("xep_0444")
+        self.register_plugin("xep_0461")
+        self.register_plugin("xep_0359")
+        self.register_plugin("xep_0424")
 
     async def on_session_start(self, event):
         self.send_presence()
@@ -1060,41 +843,26 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
         if XMPP_IS_MUC:
             self.plugin["xep_0045"].join_muc(XMPP_PEER_JID, XMPP_MUC_NICK, password=XMPP_MUC_PASSWORD)
-            logger.info("XMPP: зашёл в комнату %s как %s", XMPP_PEER_JID, XMPP_MUC_NICK)
+            logger.info("XMPP: joined room %s as %s", XMPP_PEER_JID, XMPP_MUC_NICK)
 
-        logger.info("XMPP: сессия начата, вошёл как %s", self.boundjid.bare)
+        logger.info("XMPP: session started, signed in as %s", self.boundjid.bare)
 
     async def on_xmpp_disconnected(self, event):
-        """Явная защита от того, что соединение может оборваться и не
-        восстановиться само (замечено на практике — XMPP-сторона моста
-        иногда переставала пересылать сообщения через день-два, тогда
-        как Discord продолжал работать нормально). Полагаться только на
-        встроенное поведение slixmpp оказалось недостаточно надёжно —
-        переподключаемся явно сами, с небольшой паузой."""
-        logger.warning("XMPP: соединение разорвано (%s) — переподключаюсь через 5 сек", event)
+        logger.warning("XMPP: connection lost (%s) — reconnecting in 5 s", event)
         await asyncio.sleep(5)
         try:
             self.connect()
         except Exception:
-            logger.exception("XMPP: не удалось переподключиться")
+            logger.exception("XMPP: reconnect failed")
 
     def _is_from_peer(self, msg) -> bool:
         if XMPP_IS_MUC:
             if str(msg["mucnick"]) == XMPP_MUC_NICK:
-                return False  # это наше же эхо из MUC
+                return False
             return str(msg["from"].bare) == XMPP_PEER_JID
         return str(msg["from"].bare) == XMPP_PEER_JID
 
     def _learn_own_stanza_id(self, msg) -> None:
-        """MUC-сервер отражает нам наши же сообщения обратно и добавляет
-        к ним <stanza-id> (XEP-0359) — уникальный id, назначенный именно
-        комнатой. Именно на НЕГО (а не на наш собственный client-side id)
-        ссылаются reply/reactions в MUC согласно спецификации — без этого
-        входящие reply/реакции на наши сообщения не находят совпадения.
-
-        Также разрешает "future", если send_text/send_file ждут
-        подтверждения id именно этого сообщения (см. _send_and_confirm).
-        """
         if not XMPP_IS_MUC:
             return
         client_id = msg["id"] or None
@@ -1110,44 +878,16 @@ class XMPPBridge(slixmpp.ClientXMPP):
 
         resolved_id = real_id if (real_id and real_id != client_id) else client_id
 
-        # ВРЕМЕННАЯ ДИАГНОСТИКА: печатаем occupant-id этого эха — сравниваем
-        # occupant-id обычных сообщений с occupant-id retraction-сообщений,
-        # проверяем гипотезу про спецификацию (XEP-0424 требует совпадения
-        # occupant-id между исходным сообщением и retraction в полу-
-        # анонимных MUC). Ищем прямо в сыром XML — не зависит от того,
-        # зарегистрирован ли у нас плагин xep_0421.
-        try:
-            occupant_el = msg.xml.find("{urn:xmpp:occupant-id:0}occupant-id")
-            occupant_id = occupant_el.get("id") if occupant_el is not None else None
-            is_retraction = msg.xml.find("{urn:xmpp:message-retract:1}retract") is not None
-            logger.info(
-                "ДИАГНОСТИКА: occupant-id нашего эха (retraction=%s, resolved_id=%s): %s",
-                is_retraction, resolved_id, occupant_id,
-            )
-        except Exception:
-            pass
-
         if real_id and real_id != client_id:
             key = _xmpp_lookup.get(client_id)
             if key:
-                _link_record(key, xmpp=real_id)  # добавляет доп. запись в _xmpp_lookup
+                _link_record(key, xmpp=real_id)
 
         if future is not None and not future.done():
             future.set_result(resolved_id)
 
     async def _send_and_confirm(self, stanza) -> str:
-        """Отправляет стензу и, если это MUC, дожидается эха от сервера
-        комнаты с настоящим stanza-id (см. _learn_own_stanza_id) —
-        нужно, чтобы reply/реакции на это сообщение сразу ссылались на
-        правильный id, а не ловили гонку при быстрых последовательных
-        сообщениях. Если эхо не пришло за разумное время — используем
-        клиентский id как есть (не блокируем работу бота навсегда).
-        """
         client_id = stanza["id"]
-        if stanza["reply"]["id"]:
-            # ВРЕМЕННАЯ ДИАГНОСТИКА: печатаем ровно то, что реально уходит
-            # на сервер, когда это reply — чтобы исключить любые сюрпризы.
-            logger.info("ДИАГНОСТИКА: отправляю reply-стензу:\n%s", str(stanza))
         future = None
         if XMPP_IS_MUC:
             future = asyncio.get_event_loop().create_future()
@@ -1157,49 +897,28 @@ class XMPPBridge(slixmpp.ClientXMPP):
             return client_id
         try:
             resolved = await asyncio.wait_for(future, timeout=8)
-            if stanza["reply"]["id"]:
-                logger.info("ДИАГНОСТИКА: подтверждённый канонический id = %s", resolved)
             return resolved
         except asyncio.TimeoutError:
             self._pending_echo_futures.pop(client_id, None)
             logger.warning(
-                "Не дождался эха от MUC для сообщения %s за 8 сек — "
-                "использую клиентский id как есть (reply на него может не сработать)",
+                "No MUC echo received for message %s within 8 s — "
+                "using the client id as is (replies to it may not work)",
                 client_id,
             )
             return client_id
 
     async def on_xmpp_message(self, msg):
-        """Обрабатывает входящие XMPP-сообщения: новые и правки."""
         if msg["type"] not in ("chat", "normal", "groupchat"):
             return
         if XMPP_IS_MUC and str(msg["mucnick"]) == XMPP_MUC_NICK:
-            # ВРЕМЕННАЯ ДИАГНОСТИКА: подтверждаем, что сервер реально
-            # отразил обратно нашу reaction-стензу (как раньше делали
-            # для retraction).
-            if msg["reactions"]["id"]:
-                logger.info("ДИАГНОСТИКА: сервер отразил обратно нашу reaction-стензу:\n%s", str(msg))
             self._learn_own_stanza_id(msg)
             return
         if not self._is_from_peer(msg):
             return
 
-        # Стензы retraction (XEP-0424) часто несут текстовый <body> как
-        # fallback для клиентов без поддержки удаления (например, Monocles
-        # сама подставляет "This message has been retracted by the
-        # sender."). Отдельный обработчик on_xmpp_retraction уже разбирает
-        # такие стензы для пересылки удаления — здесь их нужно
-        # проигнорировать, иначе fallback-текст улетит как обычное новое
-        # сообщение на все площадки.
         if msg["retract"]["id"]:
             return
 
-        # То же самое с реакциями (XEP-0444) — Monocles шлёт structured
-        # <reactions> ВМЕСТЕ с текстовым fallback-телом (цитата + сам
-        # эмодзи) для клиентов без поддержки реакций. on_xmpp_reactions
-        # уже обрабатывает такие стензы отдельно — здесь их надо
-        # проигнорировать, иначе fallback-текст улетит как отдельное
-        # новое сообщение вдобавок к самой реакции.
         if msg["reactions"]["id"]:
             return
 
@@ -1213,31 +932,21 @@ class XMPPBridge(slixmpp.ClientXMPP):
         sender = str(msg["mucnick"]) if XMPP_IS_MUC else str(msg["from"].bare)
         display_sender = _colored_author(f"xmpp:{sender}", sender)
 
-        # ВРЕМЕННАЯ ДИАГНОСТИКА: если структурированная правка (XEP-0308)
-        # не распознана — печатаем сырой XML, чтобы понять, что реально
-        # шлёт клиент при редактировании (аналогично истории с reply).
-        if not correction_id:
-            logger.info("ДИАГНОСТИКА: сообщение без распознанной правки. Сырой XML:\n%s", str(msg))
-
-        # --- это исправление ранее отправленного сообщения ---
         if correction_id:
             _prune_bridge_records()
             key = _xmpp_lookup.get(correction_id)
             record = _bridge_records.get(key) if key else None
             if not record or time.time() - record["ts"] > EDIT_WINDOW_SECONDS:
                 logger.info(
-                    "Исправление XMPP-сообщения %s: оригинал не найден или окно "
-                    "редактирования истекло — игнорирую",
+                    "Correction of XMPP message %s: original not found or the "
+                    "edit window expired — ignoring",
                     correction_id,
                 )
                 return
 
-            # Discord сам показывает пометку "(edited)" при вызове .edit() —
-            # свою дописывать не нужно. Telegram для правок от ботов такую
-            # пометку не показывает вообще — дописываем текстом сами.
             text_tg = (
                 f"{_html_escape(display_sender, quote=False)}: "
-                f"{_convert_markup(_strip_manual_quote_for_telegram(body), 'xmpp', 'telegram')} (ред.)"
+                f"{_convert_markup(_strip_manual_quote_for_telegram(body), 'xmpp', 'telegram')} (edited)"
             )
             text_discord = f"{display_sender}: {_convert_markup(body, 'xmpp', 'discord')}"
 
@@ -1248,48 +957,27 @@ class XMPPBridge(slixmpp.ClientXMPP):
                     )
                 except BadRequest as e:
                     if "not modified" not in str(e).lower():
-                        logger.exception("Не удалось применить исправление в Telegram")
+                        logger.exception("Could not apply the correction in Telegram")
                 except Exception:
-                    logger.exception("Не удалось применить исправление в Telegram")
+                    logger.exception("Could not apply the correction in Telegram")
             if discord_bridge and record.get("discord"):
                 try:
                     await discord_bridge.send_correction(record["discord"], text_discord)
                 except Exception:
-                    logger.exception("Не удалось применить исправление в Discord")
+                    logger.exception("Could not apply the correction in Discord")
             return
 
-        # --- обычное новое сообщение ---
         reply_id = msg["reply"]["id"] or None
         effective_body = body
         quote_matched_key = None
 
-        # Пробуем распознать "ручную" текстовую цитату (так делает Monocles
-        # Chat, а также мосты вроде matrixt2bot из Matrix) и сопоставить её
-        # с недавно отправленными сообщениями по тексту. ВАЖНО: делаем это
-        # независимо от наличия структурированного reply (Monocles иногда
-        # добавляет и то, и другое разом) и НЕЗАВИСИМО от того, где именно
-        # в сообщении находится цитата — она может идти и первой строкой,
-        # и последней, и даже посередине (пользователь может ответить
-        # "сверху и снизу одновременно"). _parse_manual_quote сам сканирует
-        # все строки, поэтому здесь не нужно (и не надо) проверять
-        # body.startswith(">") — раньше это было причиной того, что
-        # привязка reply работала только для цитаты в самом начале.
         if ">" in body:
             quoted_text, remaining_text = _parse_manual_quote(body)
             if quoted_text:
                 if not reply_id:
                     quote_matched_key = _find_key_by_quoted_text(quoted_text)
-                # Даже если совпадение НЕ нашлось (например, цитата пришла
-                # из Matrix через несколько "прыжков" и не совпадает ни с
-                # чем в нашей памяти) — всё равно убираем "сырую" цитату
-                # из видимого текста. Иначе на другие площадки улетает
-                # разрастающийся ком вложенных "> > > >" при каждой
-                # следующей связке ответов.
                 effective_body = remaining_text
 
-        # Ответ одним (или несколькими) эмодзи на пересланное сообщение —
-        # считаем это реакцией, а не обычным ответом (полезно, если в
-        # клиенте нет отдельной кнопки для реакций).
         if (reply_id or quote_matched_key) and effective_body and not oob_url and _is_emoji_only(effective_body):
             reaction_key = _get_reply_key("xmpp", reply_id) if reply_id else quote_matched_key
             if reaction_key:
@@ -1306,25 +994,19 @@ class XMPPBridge(slixmpp.ClientXMPP):
         else:
             reply_targets = {}
 
-        # Пробуем реально скачать файл по OOB-ссылке и переслать как
-        # настоящее вложение (фото/видео/голосовое/документ), а не
-        # просто ссылкой — так пересланное с XMPP-стороны видно так же,
-        # как обычное медиа.
         local_path = None
         if oob_url:
             try:
                 local_path = await _download_url_to_file(oob_url)
             except Exception:
                 logger.warning(
-                    "Не удалось скачать файл по OOB-ссылке (%s) — пришлю просто ссылкой", oob_url
+                    "Could not download the file from the OOB link (%s) — will send it as a plain link", oob_url
                 )
 
         key = _new_bridge_record()
         client_id = msg["id"] or None
         canonical_id = client_id
         if XMPP_IS_MUC:
-            # В MUC на сообщение принято ссылаться по stanza-id (XEP-0359),
-            # назначенному самой комнатой, а не по клиентскому id отправителя.
             sid_el = msg["stanza_id"]
             if sid_el and str(sid_el["by"]) == XMPP_PEER_JID and sid_el["id"]:
                 canonical_id = sid_el["id"]
@@ -1332,16 +1014,12 @@ class XMPPBridge(slixmpp.ClientXMPP):
             peer_reply_jid = f"{XMPP_PEER_JID}/{sender}" if XMPP_IS_MUC else XMPP_PEER_JID
             _link_record(key, xmpp=canonical_id, xmpp_to=peer_reply_jid)
         if client_id and client_id != canonical_id:
-            _xmpp_lookup[client_id] = key  # доп. ключ — на случай, если кто-то сошлётся по нему
-        _remember_xmpp_text(key, body)  # для будущего сопоставления чужих текстовых цитат
+            _xmpp_lookup[client_id] = key
+        _remember_xmpp_text(key, body)
 
         if local_path is not None:
             base = effective_body or ""
             if oob_url and base:
-                # Некоторые клиенты (замечено на Monocles) дублируют ссылку
-                # на файл ещё и текстом внутри тела сообщения, хотя она уже
-                # есть в самом OOB-вложении — убираем дубликат, раз файл и
-                # так пересылается как настоящее вложение.
                 base = base.replace(oob_url, "").strip()
             caption_tg = (
                 f"{_html_escape(display_sender, quote=False)}: "
@@ -1360,7 +1038,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
                         if sent is not None:
                             _link_record(key, tg=sent.message_id)
                     except Exception:
-                        logger.exception("Не удалось переслать медиа из XMPP в Telegram")
+                        logger.exception("Could not forward media from XMPP to Telegram")
                 if discord_bridge:
                     try:
                         discord_id = await discord_bridge.send_file(
@@ -1368,12 +1046,11 @@ class XMPPBridge(slixmpp.ClientXMPP):
                         )
                         _link_record(key, discord=discord_id)
                     except Exception:
-                        logger.exception("Не удалось переслать медиа из XMPP в Discord")
+                        logger.exception("Could not forward media from XMPP to Discord")
             finally:
                 local_path.unlink(missing_ok=True)
             return
 
-        # --- нет вложения (или не удалось скачать) — обычный текст/ссылка ---
         if oob_url and not effective_body:
             text_tg = f"{_html_escape(display_sender, quote=False)}: {_html_escape(oob_url, quote=False)}"
             text_discord = f"{display_sender}: {oob_url}"
@@ -1398,17 +1075,16 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 )
                 _link_record(key, tg=sent.message_id)
             except Exception:
-                logger.exception("Не удалось переслать сообщение из XMPP в Telegram")
+                logger.exception("Could not forward the message from XMPP to Telegram")
 
         if discord_bridge:
             try:
                 discord_id = await discord_bridge.send_text(text_discord, reply_to=reply_targets.get("discord"))
                 _link_record(key, discord=discord_id)
             except Exception:
-                logger.exception("Не удалось переслать сообщение из XMPP в Discord")
+                logger.exception("Could not forward the message from XMPP to Discord")
 
     async def on_xmpp_reactions(self, msg):
-        """Обрабатывает входящие реакции (XEP-0444) и отражает их на других площадках."""
         if not self._is_from_peer(msg):
             return
         target_id = msg["reactions"]["id"] or None
@@ -1425,17 +1101,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
     async def send_text(
         self, text: str, reply_to: Optional[str] = None, reply_to_jid: Optional[str] = None
     ) -> str:
-        """Отправляет текст, возвращает КАНОНИЧЕСКИЙ id (для правок/реакций/reply).
-
-        reply_to — id сообщения, на которое отвечаем (XEP-0461).
-        reply_to_jid — полный JID автора этого сообщения (с ником-ресурсом
-        в MUC) для атрибута 'to' у <reply> — без него некоторые клиенты
-        (замечено на Monocles Chat) не признают reply валидным. Если не
-        передан, используем JID комнаты/собеседника как раньше (может не
-        сработать в MUC).
-        В MUC дожидается эха от сервера с настоящим stanza-id, чтобы
-        reply на это сообщение сразу работал корректно (см. _send_and_confirm).
-        """
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=text, mtype=mtype)
         if reply_to:
@@ -1444,39 +1109,17 @@ class XMPPBridge(slixmpp.ClientXMPP):
         return await self._send_and_confirm(stanza)
 
     async def send_correction(self, new_text: str, original_stanza_id: str) -> Optional[str]:
-        """Отправляет исправление.
-
-        ВАЖНОЕ НАБЛЮДЕНИЕ (проверено на практике): если retraction
-        (XEP-0424) отработала, а следом шлём новое сообщение с
-        <replace id="уже_удалённый_id">, Monocles Chat молча ОТБРАСЫВАЕТ
-        его целиком — видимо, интерпретирует как "правка к несуществующему
-        сообщению" и не показывает вообще. Поэтому правку теперь делаем
-        так: удаляем старое сообщение, затем шлём новое ОБЫЧНЫМ
-        сообщением, БЕЗ <replace> — тогда Monocles не пытается его с чем-то
-        связывать и просто показывает как есть.
-
-        Возвращает id новой стензы — вызывающий код должен обновить им
-        связку, т.к. старый id теперь "мёртв" (сообщение удалено)."""
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         try:
-            # Для правок не нужно ждать полный набор попыток (это заметно
-            # задержит появление исправленного текста) — двух с короткой
-            # паузой обычно достаточно.
             await self.send_retraction(original_stanza_id, attempts=2, delay=1.0)
         except Exception:
-            logger.exception("Не удалось отправить retraction перед правкой в XMPP")
+            logger.exception("Could not send a retraction before the edit in XMPP")
 
         stanza = self.make_message(mto=XMPP_PEER_JID, mbody=new_text, mtype=mtype)
         stanza.send()
         return stanza["id"]
 
     async def send_reaction(self, target_stanza_id: str, emojis: set) -> None:
-        """Собираем стензу вручную (не через self["xep_0444"].send_reactions),
-        чтобы точно проставить <store/> (XEP-0334) — это официальная
-        ЗАВИСИМОСТЬ самого XEP-0444, и у сообщения с одними реакциями нет
-        <body>, а мы уже знаем (по опыту с retraction), что сервер xmpp.jp
-        не ретранслирует в комнату сообщения без body и без этой
-        подсказки."""
         from xml.etree import ElementTree as ET
 
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
@@ -1492,29 +1135,14 @@ class XMPPBridge(slixmpp.ClientXMPP):
         store_el = ET.Element("{urn:xmpp:hints}store")
         stanza.append(store_el)
 
-        # ВРЕМЕННАЯ ДИАГНОСТИКА: проверяем реальный исходящий XML.
-        try:
-            logger.info("ДИАГНОСТИКА: отправляю reaction-стензу:\n%s", str(stanza))
-        except Exception:
-            pass
 
         stanza.send()
 
     async def send_retraction_reliable(self, target_stanza_id: str) -> None:
-        """Настоящее удаление сообщений (не правок).
-
-        Раньше здесь был только один шаг (сообщение с <replace id="X">
-        без предварительного retract) — на практике оказалось, что этого
-        недостаточно для надёжного удаления МЕДИА-сообщений: картинка
-        остаётся видимой, а вместо неё вылезает отдельным сообщением
-        текст-заглушка. Возвращаем двухшаговый подход: сначала настоящий
-        <retract> (XEP-0424, с несколькими попытками — см. send_retraction),
-        затем следом <replace> на тот же id — комбинация оказалась
-        надёжнее, чем любой из двух способов по отдельности."""
         try:
             await self.send_retraction(target_stanza_id)
         except Exception:
-            logger.exception("Не удалось отправить retraction при удалении в XMPP")
+            logger.exception("Could not send a retraction for the deletion in XMPP")
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         stanza = self.make_message(
             mto=XMPP_PEER_JID,
@@ -1525,25 +1153,9 @@ class XMPPBridge(slixmpp.ClientXMPP):
         stanza.send()
 
     async def send_retraction(self, target_stanza_id: str, attempts: int = 3, delay: float = 2.0) -> None:
-        """Отправляет удаление (retraction, XEP-0424) ранее отправленного
-        сообщения. Собрано вручную (не через self["xep_0424"].send_retraction)
-        и сверено построчно с официальным примером из самой спецификации
-        (https://xmpp.org/extensions/xep-0424.html, раздел "Use Case") —
-        порядок элементов, текст fallback-body (конвенция /me, XEP-0245) и
-        атрибут for="urn:xmpp:message-retract:1" у <fallback> (обязателен
-        по XEP-0428) сделаны так же, как в эталонном примере.
-        Совпадает с тем, как это делает converse.js (сверено с их тестами).
-
-        Отправляет НЕСКОЛЬКО раз с паузой — на практике одиночная попытка
-        не всегда доходит с первого раза. Ограниченное число попыток —
-        не бесконечный повтор.
-        """
         from xml.etree import ElementTree as ET
 
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
-        # Текст-заглушка нарочно общий, без содержимого удаляемого
-        # сообщения (спецификация прямо требует этого в разделе Security
-        # Considerations) — ровно текст из официального примера.
         fallback_text = "/me retracted a previous message, but it's unsupported by your client."
 
         for i in range(attempts):
@@ -1567,8 +1179,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
                 await asyncio.sleep(delay)
 
     async def on_xmpp_retraction(self, msg):
-        """Входящее удаление сообщения от собеседника — пробрасываем на
-        другие площадки."""
         if not self._is_from_peer(msg):
             return
         retract_id = msg["retract"]["id"] or None
@@ -1585,10 +1195,6 @@ class XMPPBridge(slixmpp.ClientXMPP):
         _forget_record_by_key(key)
 
     async def _manual_upload_with_browser_headers(self, filepath: Path) -> str:
-        """Запасной путь загрузки: сами запрашиваем слот (id) через
-        XEP-0363, но PUT делаем своим aiohttp-запросом с "браузерными"
-        заголовками — на случай, если сервер блокирует автоматические
-        запросы без них (замечено на xmpp.jp для видео/gif)."""
         import aiohttp
         import mimetypes
 
@@ -1602,7 +1208,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
             found = await upload_plugin.find_upload_service()
             domain = found["from"] if found is not None else None
         if not domain:
-            raise RuntimeError("не удалось определить сервис HTTP Upload")
+            raise RuntimeError("could not determine the HTTP Upload service")
 
         slot_iq = await upload_plugin.request_slot(domain, basename, size, content_type)
         slot = slot_iq["http_upload_slot"]
@@ -1614,7 +1220,7 @@ class XMPPBridge(slixmpp.ClientXMPP):
             for h in slot["put"]["headers"]:
                 headers[h["name"]] = h["value"]
         except Exception:
-            pass  # не у всех серверов есть доп. заголовки в слоте — не критично
+            pass
         headers.setdefault("Content-Type", content_type)
         headers["User-Agent"] = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1636,60 +1242,35 @@ class XMPPBridge(slixmpp.ClientXMPP):
         self, filepath: Path, caption: str = "", reply_to: Optional[str] = None,
         reply_to_jid: Optional[str] = None,
     ) -> Optional[str]:
-        """Загружает файл на XMPP-сервер (XEP-0363) и отправляет ссылку с OOB.
-
-        Возвращает id отправленной станзы (для правок/реакций/reply),
-        либо None, если файл вообще не удалось отправить.
-        """
 
         async def _fallback_link_or_error(error_note: str) -> Optional[str]:
-            # Раньше здесь можно было прислать прямую ссылку на исходный
-            # файл (например, из Telegram) вместо текста ошибки — но
-            # такая ссылка содержит токен бота в открытом виде, а канал
-            # групповой — решили не рисковать безопасностью токена ради
-            # красивого фолбэка.
             return await self.send_text(f"{caption} {error_note}".strip())
 
         try:
             url = await self["xep_0363"].upload_file(str(filepath))
         except UploadServiceNotFound:
-            logger.warning("На XMPP-сервере не найден сервис HTTP Upload")
-            return await _fallback_link_or_error("(сервер не поддерживает загрузку файлов)")
+            logger.warning("No HTTP Upload service found on the XMPP server")
+            return await _fallback_link_or_error("(the server does not support file uploads)")
         except FileTooBig as e:
-            logger.warning("Файл слишком большой для загрузки: %s", e)
-            return await _fallback_link_or_error("(файл слишком большой для XMPP-сервера)")
+            logger.warning("File is too large to upload: %s", e)
+            return await _fallback_link_or_error("(file is too large for the XMPP server)")
         except HTTPError as e:
-            # Некоторые серверы (замечено на xmpp.jp) отклоняют
-            # автоматическую загрузку некоторых типов файлов (видео/gif)
-            # с 405 — но при этом те же файлы нормально загружаются через
-            # обычный XMPP-клиент вручную. Похоже, дело не в самом файле,
-            # а в том, что PUT-запрос от slixmpp не похож на "настоящий"
-            # браузерный запрос (нет привычных заголовков вроде
-            # User-Agent). Пробуем залить вручную с такими заголовками.
-            logger.warning("Сервер отклонил загрузку (%s), пробую вручную с браузерными заголовками", e)
+            logger.warning("The server rejected the upload (%s), retrying manually with browser headers", e)
             try:
                 url = await self._manual_upload_with_browser_headers(filepath)
-                logger.info("Обходной путь сработал — файл загружен вручную с браузерными заголовками")
+                logger.info("Workaround succeeded — file uploaded manually with browser headers")
             except Exception as manual_err:
-                # Перепробовали и смену расширения, и браузерные заголовки, и
-                # перекодирование в WebP (через Pillow/ffmpeg) — сервер
-                # (xmpp.jp) одинаково отклоняет загрузку независимо от
-                # формата и размера файла. Похоже на WAF с проверкой через
-                # JavaScript-челлендж (та же история, что и с Rustix/
-                # Pterodactyl для /mcstart) — такое принципиально не обойти
-                # обычным HTTP-клиентом без настоящего браузера. Дальше не
-                # пытаемся, просто сообщаем об ошибке.
-                logger.warning("Ручная загрузка тоже не сработала (%s) — сервер отклоняет файл", manual_err)
-                return await _fallback_link_or_error(f"(сервер отклонил загрузку файла: {e})")
+                logger.warning("Manual upload failed too (%s) — the server rejects the file", manual_err)
+                return await _fallback_link_or_error(f"(the server rejected the file upload: {e})")
         except IqError as e:
-            logger.exception("Ошибка загрузки файла на XMPP-сервер")
-            return await _fallback_link_or_error(f"(ошибка загрузки файла: {e})")
+            logger.exception("File upload to the XMPP server failed")
+            return await _fallback_link_or_error(f"(file upload error: {e})")
         except IqTimeout as e:
-            logger.exception("Таймаут при загрузке файла на XMPP-сервер")
-            return await _fallback_link_or_error(f"(таймаут при загрузке файла: {e})")
+            logger.exception("Timeout while uploading the file to the XMPP server")
+            return await _fallback_link_or_error(f"(file upload timeout: {e})")
         except OSError as e:
-            logger.exception("Сетевая ошибка при загрузке файла на XMPP-сервер")
-            return await _fallback_link_or_error(f"(сетевая ошибка при загрузке файла: {e})")
+            logger.exception("Network error while uploading the file to the XMPP server")
+            return await _fallback_link_or_error(f"(network error during file upload: {e})")
 
         mtype = "groupchat" if XMPP_IS_MUC else "chat"
         body = f"{caption}\n{url}".strip() if caption else url
@@ -1701,44 +1282,33 @@ class XMPPBridge(slixmpp.ClientXMPP):
         return await self._send_and_confirm(stanza)
 
 
-# ========================================================================
-# DISCORD-СТОРОНА
-# ========================================================================
-
 _DiscordBase = discord.Client if discord is not None else object
 
 
 class DiscordBridge(_DiscordBase):
-    """Discord-клиент, принимающий/отправляющий текст, файлы, правки, реакции."""
 
     def __init__(self):
         if discord is None:
             raise RuntimeError(
-                "discord.py не установлен (pip install discord.py), а DISCORD_BOT_TOKEN задан"
+                "discord.py is not installed (pip install discord.py) but DISCORD_BOT_TOKEN is set"
             )
         intents = discord.Intents.default()
         intents.message_content = True
         intents.reactions = True
         intents.guilds = True
         super().__init__(intents=intents)
-        self.bridge_channel = None  # type: Optional["discord.abc.Messageable"]
-        # Discord-шлюз иногда повторно доставляет событие о недавнем
-        # сообщении при переподключении — без этого получались бы
-        # дубликаты (особенно заметно на медиа).
+        self.bridge_channel = None
         self._recent_message_ids: set = set()
         self._recent_message_ids_order: list = []
 
-        # Настоящая slash-команда /start (появляется в автодополнении
-        # Discord при вводе "/") — раньше была просто проверка текста
-        # сообщения, из-за чего не показывалась в списке команд.
         self.tree = discord.app_commands.CommandTree(self)
 
-        @self.tree.command(name="start", description="Сделать этот канал каналом моста")
+        @self.tree.command(name="start", description="Make this channel the bridge channel")
         async def start_command(interaction: "discord.Interaction"):
             perms = interaction.user.guild_permissions if interaction.guild else None
             if not perms or not perms.administrator:
                 await interaction.response.send_message(
-                    "⛔ Эта команда доступна только администраторам сервера.", ephemeral=True
+                    "⛔ This command is available to server administrators only.", ephemeral=True
                 )
                 return
             global DISCORD_CHANNEL_ID
@@ -1746,10 +1316,10 @@ class DiscordBridge(_DiscordBase):
             self.bridge_channel = interaction.channel
             _db_save_setting("discord_channel_id", str(interaction.channel_id))
             await interaction.response.send_message(
-                f"✅ Мост теперь работает в этом канале (id: `{interaction.channel_id}`)."
+                f"✅ The bridge now works in this channel (id: `{interaction.channel_id}`)."
             )
             logger.info(
-                "Discord: канал моста установлен командой /start: #%s (%s)",
+                "Discord: bridge channel set with /start: #%s (%s)",
                 getattr(interaction.channel, "name", interaction.channel_id), interaction.channel_id,
             )
 
@@ -1767,11 +1337,11 @@ class DiscordBridge(_DiscordBase):
         try:
             await self.tree.sync()
         except Exception:
-            logger.exception("Не удалось синхронизировать slash-команды Discord")
+            logger.exception("Could not sync Discord slash commands")
         if DISCORD_CHANNEL_ID is None:
             logger.info(
-                "Discord: подключился как %s, канал ещё не выбран — "
-                "напишите /start в нужном канале", self.user,
+                "Discord: connected as %s, no channel selected yet — "
+                "run /start in the desired channel", self.user,
             )
             return
         channel = self.get_channel(DISCORD_CHANNEL_ID)
@@ -1779,11 +1349,11 @@ class DiscordBridge(_DiscordBase):
             try:
                 channel = await self.fetch_channel(DISCORD_CHANNEL_ID)
             except Exception:
-                logger.exception("Не удалось найти канал Discord с ID %s", DISCORD_CHANNEL_ID)
+                logger.exception("Could not find the Discord channel with ID %s", DISCORD_CHANNEL_ID)
                 return
         self.bridge_channel = channel
         logger.info(
-            "Discord: подключился как %s, канал: #%s",
+            "Discord: connected as %s, channel: #%s",
             self.user, getattr(channel, "name", DISCORD_CHANNEL_ID),
         )
 
@@ -1794,14 +1364,13 @@ class DiscordBridge(_DiscordBase):
         if DISCORD_CHANNEL_ID is None or message.channel.id != DISCORD_CHANNEL_ID:
             return
         if self._already_processed(message.id):
-            logger.info("Discord прислал повторно уже обработанное сообщение %s — игнорирую", message.id)
+            logger.info("Discord redelivered an already processed message %s — ignoring", message.id)
             return
 
         author = _colored_author(f"discord:{message.author.id}", message.author.display_name)
 
         replied_id = message.reference.message_id if message.reference else None
 
-        # Ответ одним эмодзи на пересланное сообщение — считаем реакцией.
         if replied_id and message.content and not message.attachments and _is_emoji_only(message.content):
             reaction_key = _get_reply_key("discord", replied_id)
             if reaction_key:
@@ -1810,19 +1379,18 @@ class DiscordBridge(_DiscordBase):
 
         reply_targets = _get_reply_targets("discord", replied_id) if replied_id else {}
 
-        # --- опрос (poll) ---
         poll = getattr(message, "poll", None)
         if poll is not None:
             try:
                 question = poll.question.text if hasattr(poll.question, "text") else str(poll.question)
-                lines = [f"📊 Опрос от {author}: {question}"]
+                lines = [f"📊 Poll from {author}: {question}"]
                 for i, answer in enumerate(poll.answers, start=1):
                     answer_text = answer.text if hasattr(answer, "text") else str(answer)
                     lines.append(f"{i}) {answer_text}")
                 text = "\n".join(lines)
             except Exception:
-                logger.exception("Не удалось разобрать опрос Discord, пересылаю как есть")
-                text = f"{author}: [опрос — не удалось получить содержимое]"
+                logger.exception("Could not parse the Discord poll, forwarding as is")
+                text = f"{author}: [poll — could not get its content]"
             key = _new_bridge_record(discord=message.id)
             if xmpp_bridge:
                 try:
@@ -1831,7 +1399,7 @@ class DiscordBridge(_DiscordBase):
                     )
                     _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                 except Exception:
-                    logger.exception("Не удалось переслать опрос из Discord в XMPP")
+                    logger.exception("Could not forward the poll from Discord to XMPP")
             if telegram_app:
                 try:
                     sent = await telegram_app.bot.send_message(
@@ -1840,10 +1408,9 @@ class DiscordBridge(_DiscordBase):
                     )
                     _link_record(key, tg=sent.message_id)
                 except Exception:
-                    logger.exception("Не удалось переслать опрос из Discord в Telegram")
+                    logger.exception("Could not forward the poll from Discord to Telegram")
             return
 
-        # --- вложения ---
         has_attachments = bool(message.attachments)
         _quote = _get_xmpp_quote_preview("discord", replied_id) if replied_id else None
         for attachment in message.attachments:
@@ -1861,7 +1428,7 @@ class DiscordBridge(_DiscordBase):
             try:
                 local_path = await _download_discord_attachment(attachment)
             except Exception:
-                logger.exception("Не удалось скачать вложение из Discord")
+                logger.exception("Could not download the Discord attachment")
                 continue
             key = _new_bridge_record(discord=message.id)
             try:
@@ -1874,7 +1441,7 @@ class DiscordBridge(_DiscordBase):
                         if xmpp_id:
                             _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                     except Exception:
-                        logger.exception("Не удалось переслать вложение из Discord в XMPP")
+                        logger.exception("Could not forward the attachment from Discord to XMPP")
                 if telegram_app:
                     try:
                         sent = await _tg_send_file(
@@ -1883,11 +1450,10 @@ class DiscordBridge(_DiscordBase):
                         if sent is not None:
                             _link_record(key, tg=sent.message_id)
                     except Exception:
-                        logger.exception("Не удалось переслать вложение из Discord в Telegram")
+                        logger.exception("Could not forward the attachment from Discord to Telegram")
             finally:
                 local_path.unlink(missing_ok=True)
 
-        # --- текст (только если не было вложений — иначе текст уже ушёл как подпись) ---
         if has_attachments or not message.content:
             return
         xmpp_text = f"{author}: {_convert_markup(message.content, 'discord', 'xmpp')}"
@@ -1909,7 +1475,7 @@ class DiscordBridge(_DiscordBase):
                 _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                 _remember_xmpp_text(key, xmpp_text)
             except Exception:
-                logger.exception("Не удалось переслать сообщение из Discord в XMPP")
+                logger.exception("Could not forward the message from Discord to XMPP")
 
         if telegram_app:
             try:
@@ -1919,7 +1485,7 @@ class DiscordBridge(_DiscordBase):
                 )
                 _link_record(key, tg=sent.message_id)
             except Exception:
-                logger.exception("Не удалось переслать сообщение из Discord в Telegram")
+                logger.exception("Could not forward the message from Discord to Telegram")
 
     async def on_message_delete(self, message: "discord.Message"):
         if message.channel.id != DISCORD_CHANNEL_ID:
@@ -1947,10 +1513,10 @@ class DiscordBridge(_DiscordBase):
             return
 
         author = _colored_author(f"discord:{after.author.id}", after.author.display_name)
-        xmpp_text = f"{author}: {_convert_markup(after.content, 'discord', 'xmpp')} (ред.)"
+        xmpp_text = f"{author}: {_convert_markup(after.content, 'discord', 'xmpp')} (edited)"
         tg_text = (
             f"{_html_escape(author, quote=False)}: "
-            f"{_convert_markup(_strip_manual_quote_for_telegram(after.content), 'discord', 'telegram')} (ред.)"
+            f"{_convert_markup(_strip_manual_quote_for_telegram(after.content), 'discord', 'telegram')} (edited)"
         )
 
         if xmpp_bridge and record.get("xmpp"):
@@ -1959,7 +1525,7 @@ class DiscordBridge(_DiscordBase):
                 if new_xmpp_id:
                     _link_record(key, xmpp=new_xmpp_id)
             except Exception:
-                logger.exception("Не удалось переслать исправление в XMPP")
+                logger.exception("Could not forward the correction to XMPP")
         if telegram_app and record.get("tg"):
             try:
                 await telegram_app.bot.edit_message_text(
@@ -1967,9 +1533,9 @@ class DiscordBridge(_DiscordBase):
                 )
             except BadRequest as e:
                 if "not modified" not in str(e).lower():
-                    logger.exception("Не удалось применить исправление в Telegram")
+                    logger.exception("Could not apply the correction in Telegram")
             except Exception:
-                logger.exception("Не удалось применить исправление в Telegram")
+                logger.exception("Could not apply the correction in Telegram")
 
     async def on_raw_reaction_add(self, payload):
         await self._handle_reaction_change(payload)
@@ -1979,7 +1545,7 @@ class DiscordBridge(_DiscordBase):
 
     async def _handle_reaction_change(self, payload):
         if self.user and payload.user_id == self.user.id:
-            return  # это наша же mirror-реакция
+            return
         if payload.channel_id != DISCORD_CHANNEL_ID:
             return
 
@@ -1992,7 +1558,7 @@ class DiscordBridge(_DiscordBase):
             channel = self.bridge_channel or self.get_channel(payload.channel_id)
             message = await channel.fetch_message(payload.message_id)
         except Exception:
-            logger.exception("Не удалось получить сообщение Discord для пересчёта реакций")
+            logger.exception("Could not fetch the Discord message to recount reactions")
             return
 
         active = set()
@@ -2005,7 +1571,7 @@ class DiscordBridge(_DiscordBase):
 
     async def send_text(self, text: str, reply_to: Optional[int] = None) -> int:
         if self.bridge_channel is None:
-            raise RuntimeError("Discord-канал ещё не готов")
+            raise RuntimeError("The Discord channel is not ready yet")
         reference = (
             discord.MessageReference(
                 message_id=reply_to, channel_id=DISCORD_CHANNEL_ID, fail_if_not_exists=False
@@ -2022,7 +1588,7 @@ class DiscordBridge(_DiscordBase):
             message = await self.bridge_channel.fetch_message(discord_message_id)
             await message.edit(content=new_text)
         except Exception:
-            logger.exception("Не удалось применить исправление в Discord")
+            logger.exception("Could not apply the correction in Discord")
 
     async def delete_message(self, discord_message_id: int) -> None:
         if self.bridge_channel is None:
@@ -2031,15 +1597,13 @@ class DiscordBridge(_DiscordBase):
             message = await self.bridge_channel.fetch_message(discord_message_id)
             await message.delete()
         except discord.errors.NotFound:
-            # Уже удалено (например, другой путь обнаружения удаления
-            # сработал параллельно чуть раньше) — не ошибка, просто гонка.
             pass
         except Exception:
-            logger.exception("Не удалось удалить сообщение в Discord")
+            logger.exception("Could not delete the message in Discord")
 
     async def send_file(self, filepath: Path, caption: str = "", reply_to: Optional[int] = None) -> int:
         if self.bridge_channel is None:
-            raise RuntimeError("Discord-канал ещё не готов")
+            raise RuntimeError("The Discord channel is not ready yet")
         reference = (
             discord.MessageReference(
                 message_id=reply_to, channel_id=DISCORD_CHANNEL_ID, fail_if_not_exists=False
@@ -2057,7 +1621,7 @@ class DiscordBridge(_DiscordBase):
         try:
             message = await self.bridge_channel.fetch_message(discord_message_id)
         except Exception:
-            logger.exception("Не удалось получить сообщение Discord для установки реакций")
+            logger.exception("Could not fetch the Discord message to set reactions")
             return
 
         current = {str(r.emoji) for r in message.reactions if r.me}
@@ -2065,17 +1629,13 @@ class DiscordBridge(_DiscordBase):
             try:
                 await message.remove_reaction(e, self.user)
             except Exception:
-                logger.exception("Не удалось убрать реакцию %s в Discord", e)
+                logger.exception("Could not remove reaction %s in Discord", e)
         for e in emojis - current:
             try:
                 await message.add_reaction(e)
             except Exception:
-                logger.exception("Не удалось поставить реакцию %s в Discord", e)
+                logger.exception("Could not add reaction %s in Discord", e)
 
-
-# ========================================================================
-# TELEGRAM-СТОРОНА
-# ========================================================================
 
 _MEDIA_ATTRS = ("photo", "video", "voice", "audio", "document", "sticker", "video_note", "animation")
 
@@ -2083,10 +1643,6 @@ _MEDIA_ATTRS = ("photo", "video", "voice", "audio", "document", "sticker", "vide
 async def _tg_send_file(
     local_path: Path, caption: str, reply_to: Optional[int] = None, parse_mode: Optional[str] = None
 ):
-    """Отправляет файл в Telegram, подбирая подходящий метод по расширению.
-
-    Возвращает отправленное telegram.Message (нужно для связки reply/правок).
-    """
     suffix = local_path.suffix.lower()
     with open(local_path, "rb") as f:
         if suffix in (".jpg", ".jpeg", ".png", ".webp"):
@@ -2112,35 +1668,28 @@ async def _tg_send_file(
 
 
 async def tg_handle_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /chatid — присылает ID текущего чата, группы или канала."""
     chat = update.effective_chat
     if chat is None:
         return
-    title = chat.title or chat.first_name or "этот чат"
+    title = chat.title or chat.first_name or "this chat"
     await context.bot.send_message(
         chat_id=chat.id,
         text=(
-            f"ID «{title}»: `{chat.id}`\n\n"
-            f"Впишите это значение в переменную TELEGRAM_CHAT_ID в .env "
-            f"и перезапустите бота, чтобы включить пересылку сообщений."
+            f"ID of “{title}”: `{chat.id}`\n\n"
+            f"Put this value into the TELEGRAM_CHAT_ID variable in .env "
+            f"and restart the bot to enable message forwarding."
         ),
         parse_mode="Markdown",
     )
-    logger.info("Команда /chatid: chat_id=%s (%s)", chat.id, title)
-
+    logger.info("/chatid command: chat_id=%s (%s)", chat.id, title)
 
 
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает входящие сообщения Telegram и пересылает их в XMPP/Discord."""
     msg = update.effective_message
     if msg is None:
         return
-    # Технические пересылки-проверки (см. _tg_check_deletions_loop) — не
-    # настоящие сообщения, пересылать их дальше не нужно.
     if msg.message_id in _verification_forward_ids:
         return
-    # Игнорируем только СВОЁ ЖЕ эхо (не любых ботов вообще — иначе
-    # ломается пересылка от сторонних ботов-мостов вроде matrixt2bot).
     if msg.from_user and msg.from_user.id == context.bot.id:
         return
 
@@ -2148,9 +1697,6 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         raw_author_name = msg.from_user.first_name
         author_key = f"tg:{msg.from_user.id}"
     elif msg.sender_chat:
-        # Пост из привязанного канала (или анонимный админ, постящий "от
-        # имени группы") приходит с sender_chat вместо from_user —
-        # раньше в таких случаях просто подставлялась заглушка "Telegram".
         raw_author_name = msg.sender_chat.title or "Telegram"
         author_key = f"tg:channel:{msg.sender_chat.id}"
     else:
@@ -2161,7 +1707,6 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     replied_id = msg.reply_to_message.message_id if msg.reply_to_message else None
 
-    # Ответ одним эмодзи на пересланное сообщение — считаем реакцией.
     if replied_id and msg.text and not has_media and _is_emoji_only(msg.text):
         reaction_key = _get_reply_key("tg", replied_id)
         if reaction_key:
@@ -2170,13 +1715,12 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     reply_targets = _get_reply_targets("tg", replied_id) if replied_id else {}
 
-    # --- опрос (poll) ---
     if msg.poll:
-        lines = [f"📊 Опрос от {author}: {msg.poll.question}"]
+        lines = [f"📊 Poll from {author}: {msg.poll.question}"]
         for i, option in enumerate(msg.poll.options, start=1):
             lines.append(f"{i}) {option.text}")
         if msg.poll.is_anonymous is False:
-            lines.append("(опрос не анонимный)")
+            lines.append("(the poll is not anonymous)")
         text = "\n".join(lines)
         key = _new_bridge_record(tg=msg.message_id)
         if xmpp_bridge:
@@ -2186,16 +1730,15 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 )
                 _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
             except Exception:
-                logger.exception("Не удалось переслать опрос из Telegram в XMPP")
+                logger.exception("Could not forward the poll from Telegram to XMPP")
         if discord_bridge:
             try:
                 discord_id = await discord_bridge.send_text(text, reply_to=reply_targets.get("discord"))
                 _link_record(key, discord=discord_id)
             except Exception:
-                logger.exception("Не удалось переслать опрос из Telegram в Discord")
+                logger.exception("Could not forward the poll from Telegram to Discord")
         return
 
-    # --- чистый текст, без вложений ---
     if msg.text and not has_media:
         xmpp_body = _format_tg_text(msg.text, msg.text_html, "xmpp")
         discord_body = _format_tg_text(msg.text, msg.text_html, "discord")
@@ -2212,7 +1755,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                 _remember_xmpp_text(key, xmpp_full_text)
             except Exception:
-                logger.exception("Не удалось переслать сообщение из Telegram в XMPP")
+                logger.exception("Could not forward the message from Telegram to XMPP")
         if discord_bridge:
             try:
                 discord_id = await discord_bridge.send_text(
@@ -2220,11 +1763,11 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 )
                 _link_record(key, discord=discord_id)
             except Exception:
-                logger.exception("Не удалось переслать сообщение из Telegram в Discord")
+                logger.exception("Could not forward the message from Telegram to Discord")
         return
 
     if not has_media:
-        return  # сервисное сообщение и т.п.
+        return
 
     caption_xmpp = f"{author}: {_format_tg_text(msg.caption, msg.caption_html, 'xmpp')}" if msg.caption else author
     caption_discord = (
@@ -2272,15 +1815,11 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 is_static_sticker = True
     except BadRequest as e:
         if "too big" in str(e).lower():
-            logger.warning("Файл превышает лимит Telegram Bot API: %s", e)
+            logger.warning("The file exceeds the Telegram Bot API limit: %s", e)
             notice = (
-                f"{author}: [файл не переслан — превышает лимит Telegram Bot API "
-                f"в {TELEGRAM_BOT_API_FILE_LIMIT_MB} МБ на скачивание ботом]"
+                f"{author}: [file not forwarded — exceeds the Telegram Bot API limit "
+                f"of {TELEGRAM_BOT_API_FILE_LIMIT_MB} MB for bot downloads]"
             )
-            # Раньше для этого уведомления не создавалась связка сообщений
-            # вовсе — из-за этого нельзя было ни отреагировать, ни ответить
-            # ни на исходное сообщение в Telegram, ни на само уведомление
-            # на других площадках. Теперь создаём как обычно.
             key = _new_bridge_record(tg=msg.message_id)
             if xmpp_bridge:
                 try:
@@ -2288,16 +1827,16 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     if xmpp_id:
                         _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
                 except Exception:
-                    logger.exception("Не удалось переслать уведомление о превышении лимита в XMPP")
+                    logger.exception("Could not forward the size limit notice to XMPP")
             if discord_bridge:
                 try:
                     discord_id = await discord_bridge.send_text(notice)
                     if discord_id:
                         _link_record(key, discord=discord_id)
                 except Exception:
-                    logger.exception("Не удалось переслать уведомление о превышении лимита в Discord")
+                    logger.exception("Could not forward the size limit notice to Discord")
         else:
-            logger.exception("Ошибка Telegram при получении файла")
+            logger.exception("Telegram error while fetching the file")
         return
 
     if file_obj is None:
@@ -2318,7 +1857,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 if xmpp_id:
                     _link_record(key, xmpp=xmpp_id, xmpp_to=_own_xmpp_reply_jid())
             except Exception:
-                logger.exception("Не удалось переслать медиа из Telegram в XMPP")
+                logger.exception("Could not forward media from Telegram to XMPP")
         if discord_bridge:
             try:
                 discord_id = await discord_bridge.send_file(
@@ -2327,21 +1866,20 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 if discord_id:
                     _link_record(key, discord=discord_id)
             except Exception:
-                logger.exception("Не удалось переслать медиа из Telegram в Discord")
+                logger.exception("Could not forward media from Telegram to Discord")
     except Exception:
-        logger.exception("Не удалось скачать медиа из Telegram")
+        logger.exception("Could not download media from Telegram")
     finally:
         try:
             local_path.unlink(missing_ok=True)
         except PermissionError:
             logger.warning(
-                "Не удалось сразу удалить временный файл %s — он ещё занят, оставляю как есть",
+                "Could not delete temporary file %s right away — it is still in use, leaving it",
                 local_path,
             )
 
 
 async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Пересылает редактирование текстового сообщения (в течение EDIT_WINDOW_SECONDS)."""
     msg = update.effective_message
     if msg is None or not msg.text:
         return
@@ -2353,7 +1891,7 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
     record = _bridge_records.get(key) if key else None
     if not record or time.time() - record["ts"] > EDIT_WINDOW_SECONDS:
         logger.info(
-            "Отредактировано сообщение %s, но оно старше %s сек или не пересылалось — игнорирую",
+            "Message %s was edited, but it is older than %s s or was not forwarded — ignoring",
             msg.message_id, EDIT_WINDOW_SECONDS,
         )
         return
@@ -2367,24 +1905,21 @@ async def tg_handle_edited_message(update: Update, context: ContextTypes.DEFAULT
 
     if xmpp_bridge and record.get("xmpp"):
         try:
-            xmpp_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'xmpp')} (ред.)"
+            xmpp_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'xmpp')} (edited)"
             new_xmpp_id = await xmpp_bridge.send_correction(xmpp_text, record["xmpp"])
             if new_xmpp_id:
                 _link_record(key, xmpp=new_xmpp_id)
         except Exception:
-            logger.exception("Не удалось переслать исправление в XMPP")
+            logger.exception("Could not forward the correction to XMPP")
     if discord_bridge and record.get("discord"):
         try:
-            # Discord сам показывает "(edited)" при вызове .edit() — свою
-            # пометку дописывать не нужно.
             discord_text = f"{author}: {_format_tg_text(msg.text, msg.text_html, 'discord')}"
             await discord_bridge.send_correction(record["discord"], discord_text)
         except Exception:
-            logger.exception("Не удалось переслать исправление в Discord")
+            logger.exception("Could not forward the correction to Discord")
 
 
 async def tg_handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Пересылает реакцию пользователя на других площадках (бот ставит свою же)."""
     reaction = update.message_reaction
     if reaction is None:
         return
@@ -2398,10 +1933,6 @@ async def tg_handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _mirror_reactions(key, emojis, skip="tg")
 
 
-# ========================================================================
-# HTTP HEALTH-CHECK (для хостингов вроде Render, которым нужен открытый порт)
-# ========================================================================
-
 async def _start_healthcheck_server():
     port_raw = os.environ.get("PORT")
     if not port_raw:
@@ -2410,7 +1941,7 @@ async def _start_healthcheck_server():
     from aiohttp import web
 
     async def _health(request):
-        status = "мост активен" if BRIDGE_ENABLED else "бот работает в режиме /chatid"
+        status = "bridge active" if BRIDGE_ENABLED else "bot running in /chatid mode"
         return web.Response(text=f"OK — {status}")
 
     app = web.Application()
@@ -2421,42 +1952,14 @@ async def _start_healthcheck_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(port_raw))
     await site.start()
-    logger.info("HTTP health-check сервер слушает порт %s (для Render/аналогов)", port_raw)
+    logger.info("HTTP health-check server listening on port %s (for Render or similar)", port_raw)
     return runner
 
 
-# ============================================================================
-# ПРОВЕРКА УДАЛЁННЫХ СООБЩЕНИЙ TELEGRAM — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
-# Telegram Bot API НЕ присылает ботам событие "сообщение удалено" — это
-# жёсткое ограничение платформы, обойти нельзя. Единственный известный
-# обходной путь — периодически пробовать безобидную "правку" сообщения
-# (снятие несуществующей инлайн-клавиатуры): если сообщение удалено,
-# Telegram ответит ошибкой "message to edit not found"; если нет —
-# либо тихо подтвердит, либо скажет "message is not modified" (тоже
-# значит "жив"). Проверяем только сообщения, которые уже отслеживает
-# мост (не более TELEGRAM_DELETE_CHECK_BATCH штук за раз, реже одного
-# раза в TELEGRAM_DELETE_CHECK_INTERVAL секунд — чтобы не долбить API).
-#
-# ВАЖНО: теперь, когда есть MTProto-userbot (см. TELEGRAM_USERBOT_ENABLED)
-# для мгновенного обнаружения удалений, эта проверка через Bot API стала
-# просто медленной подстраховкой на случай, если MTProto-сессия
-# отключится — поэтому специально сделана НЕАГРЕССИВНОЙ, чтобы не
-# отъедать лимит запросов у обычной пересылки сообщений (см. flood
-# control — раньше слишком частая/большая проверка реально роняла
-# доставку обычных сообщений).
-#
-# Чтобы отключить — удалите/закомментируйте вызов
-# asyncio.create_task(_tg_check_deletions_loop()) в main().
-
 TELEGRAM_DELETE_CHECK_INTERVAL = int(os.environ.get("TELEGRAM_DELETE_CHECK_INTERVAL", "300"))
 TELEGRAM_DELETE_CHECK_BATCH = int(os.environ.get("TELEGRAM_DELETE_CHECK_BATCH", "30"))
-# Пауза между отдельными проверками внутри одного прохода — весь проход
-# должен укладываться в разумное время, не съедая весь интервал между
-# проходами и не отбирая лимит запросов у обычной пересылки сообщений.
 TELEGRAM_DELETE_CHECK_DELAY = float(os.environ.get("TELEGRAM_DELETE_CHECK_DELAY", "1.0"))
 
-# id технических пересылок-проверок (см. "message can't be edited" ниже) —
-# чтобы обычный обработчик сообщений не переслал их дальше как настоящие.
 _verification_forward_ids: set = set()
 
 
@@ -2465,21 +1968,11 @@ async def _forget_verification_id_later(message_id: int, delay: float = 30.0) ->
     _verification_forward_ids.discard(message_id)
 
 
-# Сообщения, которые бот не может редактировать (написаны не самим ботом —
-# то есть настоящими людьми, а не переслано ботом с других площадок).
-# Для них editMessageReplyMarkup ВСЕГДА вернёт "message can't be edited" —
-# незачем каждый раз пытаться и проваливаться в запасной способ (пересылка
-# + удаление), это заметно мигает в чате. Проверяем такие сообщения
-# намного реже, отдельным более редким циклом.
 _non_editable_tg_messages: set = set()
-_last_forward_check: dict = {}  # message_id -> time.monotonic() последней проверки пересылкой
+_last_forward_check: dict = {}
 TELEGRAM_FORWARD_CHECK_MIN_INTERVAL = float(
     os.environ.get("TELEGRAM_FORWARD_CHECK_MIN_INTERVAL", str(12 * 3600))
 )
-# Полностью выключает проверку "чужих" сообщений через пересылку+удаление
-# (та самая, что заметно мигает в чате) — например, пока настраиваете
-# MTProto-userbot и хотите временно избежать лишнего шума/мигания.
-# Обычная (дешёвая) проверка своих же сообщений бота продолжает работать.
 TELEGRAM_FORWARD_CHECK_ENABLED = (
     os.environ.get("TELEGRAM_FORWARD_CHECK_ENABLED", "true").strip().lower() == "true"
 )
@@ -2487,11 +1980,9 @@ TELEGRAM_FORWARD_CHECK_ENABLED = (
 
 async def _tg_check_deletions_loop() -> None:
     logger.info(
-        "Проверка удалений Telegram запущена (каждые %s сек, до %s сообщений за проход)",
+        "Telegram deletion check started (every %s s, up to %s messages per pass)",
         TELEGRAM_DELETE_CHECK_INTERVAL, TELEGRAM_DELETE_CHECK_BATCH,
     )
-    # Telegram может вернуть разные формулировки для удалённого сообщения
-    # в зависимости от ситуации — проверяем известные варианты сразу.
     deleted_markers = (
         "message to edit not found",
         "message_id_invalid",
@@ -2513,10 +2004,6 @@ async def _tg_check_deletions_loop() -> None:
             if not tg_id:
                 continue
 
-            # --- "чужие" сообщения (написаны не самим ботом) — не можем
-            # редактировать в принципе, проверяем только через пересылку,
-            # и не чаще, чем раз в TELEGRAM_FORWARD_CHECK_MIN_INTERVAL сек
-            # (иначе получается заметное мигание в чате на каждом проходе).
             if tg_id in _non_editable_tg_messages:
                 if not TELEGRAM_FORWARD_CHECK_ENABLED:
                     continue
@@ -2536,15 +2023,15 @@ async def _tg_check_deletions_loop() -> None:
                         )
                     except Exception:
                         logger.exception(
-                            "Не удалось удалить временную копию (id %s) после проверки пересылкой",
+                            "Could not delete the temporary copy (id %s) after the forward check",
                             forwarded.message_id,
                         )
                     asyncio.create_task(_forget_verification_id_later(forwarded.message_id))
                 except BadRequest as fe:
                     if any(marker in str(fe).lower() for marker in deleted_markers):
                         logger.info(
-                            "Обнаружено удаление сообщения Telegram %s (через пересылку) — "
-                            "удаляю на других площадках", tg_id,
+                            "Deletion of Telegram message %s detected (via forward) — "
+                            "deleting on the other platforms", tg_id,
                         )
                         await _propagate_deletion(record, skip="tg")
                         _forget_record_by_key(key)
@@ -2555,9 +2042,7 @@ async def _tg_check_deletions_loop() -> None:
                 await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
                 continue
 
-            # --- обычная (дешёвая) проверка через editMessageReplyMarkup ---
             try:
-                # Безобидно: снимаем клавиатуру, которой и так нет.
                 await telegram_app.bot.edit_message_reply_markup(
                     chat_id=TELEGRAM_CHAT_ID, message_id=tg_id, reply_markup=None
                 )
@@ -2565,48 +2050,26 @@ async def _tg_check_deletions_loop() -> None:
                 error_text = str(e).lower()
                 if any(marker in error_text for marker in deleted_markers):
                     logger.info(
-                        "Обнаружено удаление сообщения Telegram %s — удаляю на других площадках", tg_id
+                        "Deletion of Telegram message %s detected — deleting on the other platforms", tg_id
                     )
                     await _propagate_deletion(record, skip="tg")
                     _forget_record_by_key(key)
                 elif "message can't be edited" in error_text:
-                    # Сообщение написано не ботом — запоминаем и дальше
-                    # проверяем через пересылку, но редко (см. выше).
-                    # Важно: сразу проставляем "последнюю проверку" сейчас,
-                    # а не ждём следующего цикла — иначе первая пересылка-
-                    # проверка срабатывала бы уже через ~10 сек после
-                    # обнаружения, а не через полный интервал (заметное
-                    # мигание сразу после каждого нового сообщения).
                     _non_editable_tg_messages.add(tg_id)
                     _last_forward_check[tg_id] = time.monotonic()
                 elif "message is not modified" not in error_text:
-                    # Неизвестный вариант ошибки — не тот, что мы уже знаем
-                    # как "сообщение живо", и не как "сообщение удалено".
-                    # Логируем, чтобы в следующий раз не гадать вслепую.
                     logger.info(
-                        "Проверка удаления Telegram %s: неопознанный BadRequest: %s", tg_id, e
+                        "Telegram deletion check %s: unrecognized BadRequest: %s", tg_id, e
                     )
             except Exception as e:
-                logger.info("Проверка удаления Telegram %s: прочая ошибка %s: %s", tg_id, type(e).__name__, e)
+                logger.info("Telegram deletion check %s: other error %s: %s", tg_id, type(e).__name__, e)
             await asyncio.sleep(TELEGRAM_DELETE_CHECK_DELAY)
 
-
-# ============================================================================
-# TELEGRAM USERBOT (MTProto/Telethon) — НЕОБЯЗАТЕЛЬНЫЙ БЛОК.
-# Мгновенное обнаружение удаления ЛЮБЫХ сообщений в чате (не только своих)
-# через полноценный вход в отдельный Telegram-аккаунт — см. комментарий у
-# TELEGRAM_USERBOT_ENABLED в начале файла и generate_session.py рядом.
-# Работает только для супергрупп (обычные "маленькие" группы Telegram не
-# используют единую нумерацию сообщений, как супергруппы и каналы — и в
-# любом случае для нашего моста нужна именно супергруппа, чтобы у
-# сообщений был стабильный числовой id).
 
 _telegram_userbot = None
 
 
 def _tg_chat_ids_match(a: int, b: int) -> bool:
-    """Сравнивает id чата с поправкой на то, что Telethon и Bot API иногда
-    представляют id супергрупп по-разному (с "-100" в начале или без)."""
 
     def _core(x: int) -> int:
         s = str(abs(x))
@@ -2628,8 +2091,8 @@ async def _start_telegram_userbot() -> None:
         from telethon.sessions import StringSession as _TelethonStringSession
     except ImportError:
         logger.error(
-            "TELEGRAM_USERBOT_SESSION задан, но telethon не установлен "
-            "(pip install telethon) — мгновенное обнаружение удалений отключено"
+            "TELEGRAM_USERBOT_SESSION is set but telethon is not installed "
+            "(pip install telethon) — instant deletion detection is disabled"
         )
         return
 
@@ -2644,7 +2107,7 @@ async def _start_telegram_userbot() -> None:
         @client.on(_telethon_events.MessageDeleted())
         async def _on_tg_message_deleted(event):
             if event.chat_id is None:
-                return  # Telegram не всегда указывает чат при удалении — ничего не поделать
+                return
             if not _tg_chat_ids_match(event.chat_id, TELEGRAM_CHAT_ID):
                 return
             for mid in event.deleted_ids:
@@ -2656,19 +2119,19 @@ async def _start_telegram_userbot() -> None:
                 if not record:
                     continue
                 logger.info(
-                    "MTProto: мгновенно обнаружено удаление сообщения Telegram %s — "
-                    "удаляю на других площадках", mid,
+                    "MTProto: instant deletion of Telegram message %s detected — "
+                    "deleting on the other platforms", mid,
                 )
                 await _propagate_deletion(record, skip="tg")
                 _forget_record_by_key(key)
 
         me = await client.get_me()
         logger.info(
-            "MTProto-аккаунт подключён (%s) — удаления в Telegram теперь обнаруживаются мгновенно",
+            "MTProto account connected (%s) — Telegram deletions are now detected instantly",
             getattr(me, "username", None) or getattr(me, "phone", "?"),
         )
     except Exception:
-        logger.exception("Не удалось подключить MTProto-аккаунт для отслеживания удалений")
+        logger.exception("Could not connect the MTProto account for deletion tracking")
 
 
 async def _stop_telegram_userbot() -> None:
@@ -2678,10 +2141,6 @@ async def _stop_telegram_userbot() -> None:
         except Exception:
             pass
 
-
-# ========================================================================
-# ЗАПУСК
-# ========================================================================
 
 async def main() -> None:
     global telegram_app, xmpp_bridge, discord_bridge, DISCORD_CHANNEL_ID
@@ -2693,7 +2152,7 @@ async def main() -> None:
     if saved_channel:
         try:
             DISCORD_CHANNEL_ID = int(saved_channel)
-            logger.info("Discord: загружен ранее сохранённый канал (id: %s)", DISCORD_CHANNEL_ID)
+            logger.info("Discord: loaded the previously saved channel (id: %s)", DISCORD_CHANNEL_ID)
         except ValueError:
             pass
 
@@ -2708,7 +2167,7 @@ async def main() -> None:
         ipv4_transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
         forced_request = HTTPXRequest(httpx_kwargs={"transport": ipv4_transport})
         builder = builder.request(forced_request).get_updates_request(forced_request)
-        logger.info("Принудительно использую IPv4 для запросов к Telegram (TELEGRAM_FORCE_IPV4=true)")
+        logger.info("Forcing IPv4 for Telegram requests (TELEGRAM_FORCE_IPV4=true)")
 
     telegram_app = builder.build()
 
@@ -2735,29 +2194,27 @@ async def main() -> None:
 
         if XMPP_ENABLED:
             xmpp_bridge = XMPPBridge(XMPP_JID, XMPP_PASSWORD)
-            xmpp_bridge.connect()  # соединение устанавливается асинхронно на текущем event loop
+            xmpp_bridge.connect()
 
         if DISCORD_ENABLED:
             if discord is None:
                 logger.warning(
-                    "DISCORD_BOT_TOKEN задан, но discord.py не установлен "
-                    "(pip install discord.py) — Discord-сторона моста отключена"
+                    "DISCORD_BOT_TOKEN is set but discord.py is not installed "
+                    "(pip install discord.py) — the Discord side of the bridge is disabled"
                 )
             else:
                 discord_bridge = DiscordBridge()
                 asyncio.create_task(discord_bridge.start(DISCORD_BOT_TOKEN))
 
-        # Проверка удалений Telegram — необязательный блок, см. комментарий
-        # у _tg_check_deletions_loop(). Уберите строку ниже, чтобы отключить.
         asyncio.create_task(_tg_check_deletions_loop())
     else:
         missing = []
         if not TELEGRAM_CHAT_ID:
             missing.append("TELEGRAM_CHAT_ID")
         if not XMPP_ENABLED and not DISCORD_ENABLED:
-            missing.append("(XMPP_JID+XMPP_PASSWORD+XMPP_PEER_JID) или (DISCORD_BOT_TOKEN+DISCORD_CHANNEL_ID)")
+            missing.append("(XMPP_JID+XMPP_PASSWORD+XMPP_PEER_JID) or (DISCORD_BOT_TOKEN+DISCORD_CHANNEL_ID)")
         logger.warning(
-            "Мост НЕ активен — не заданы: %s. Бот работает только в режиме /chatid.",
+            "Bridge NOT active — missing: %s. The bot runs in /chatid mode only.",
             ", ".join(missing),
         )
 
@@ -2771,18 +2228,18 @@ async def main() -> None:
             if DISCORD_ENABLED:
                 targets.append("Discord")
             logger.info(
-                "Telegram-бот запущен, жду сообщений в чате %s. Цели моста: %s",
+                "Telegram bot started, waiting for messages in chat %s. Bridge targets: %s",
                 TELEGRAM_CHAT_ID, ", ".join(targets),
             )
         else:
-            logger.info("Telegram-бот запущен в режиме /chatid (напишите /chatid в нужном чате)")
+            logger.info("Telegram bot started in /chatid mode (send /chatid in the desired chat)")
 
         try:
-            await asyncio.Event().wait()  # держим процесс живым до Ctrl+C
+            await asyncio.Event().wait()
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
-            logger.info("Останавливаюсь...")
+            logger.info("Stopping...")
             await telegram_app.updater.stop()
             await telegram_app.stop()
             if xmpp_bridge is not None:
